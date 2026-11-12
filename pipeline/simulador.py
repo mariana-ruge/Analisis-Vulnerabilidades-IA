@@ -356,8 +356,35 @@ def generar_trafico_normal(cfg, rng: np.random.Generator) -> pd.DataFrame:
     return pd.DataFrame(filas)
 
 
-def generar_campana(vuln: pd.Series, cfg, rng: np.random.Generator) -> pd.DataFrame:
-    """Genera una campaña de ataque explotando una vulnerabilidad concreta."""
+def posiciones_estratificadas(vulns: pd.DataFrame, rng: np.random.Generator,
+                              fraccion_train: float = 0.7) -> pd.Series:
+    """Momento de inicio (fracción de la ventana) de cada campaña.
+
+    En cada categoría con dos o más vulnerabilidades, ~(1 - fraccion_train) de
+    las campañas empiezan al final de la ventana (después del corte train/test)
+    y el resto antes, con un margen alrededor del corte. Así todas esas
+    categorías aparecen en entrenamiento y en prueba, pero con vulnerabilidades
+    distintas en cada lado.
+    """
+    fin_train, ini_test = fraccion_train - 0.05, fraccion_train + 0.12
+    posiciones = pd.Series(0.0, index=vulns.index)
+    for _, grupo in vulns.groupby("categoria_ataque"):
+        orden = rng.permutation(grupo.index.to_numpy())
+        n = len(orden)
+        n_test = int(np.ceil(n * (1 - fraccion_train))) if n >= 2 else int(rng.random() < 1 - fraccion_train)
+        n_train = n - n_test
+        posiciones.loc[orden[:n_train]] = rng.uniform(0.02, fin_train, size=n_train)
+        posiciones.loc[orden[n_train:]] = rng.uniform(ini_test, 0.95, size=n_test)
+    return posiciones
+
+
+def generar_campana(vuln: pd.Series, cfg, rng: np.random.Generator,
+                    posicion: float | None = None) -> pd.DataFrame:
+    """Genera una campaña de ataque explotando una vulnerabilidad concreta.
+
+    `posicion` es la fracción de la ventana en la que empieza; si no se da,
+    se elige al azar.
+    """
     cat = vuln["categoria_ataque"]
     plantilla = ATAQUES[cat]
     inicio = pd.Timestamp(cfg.inicio_simulacion)
@@ -374,7 +401,9 @@ def generar_campana(vuln: pd.Series, cfg, rng: np.random.Generator) -> pd.DataFr
     if cat == "denegacion_servicio":
         n_explot *= 3
 
-    t = inicio + duracion_total * float(rng.uniform(0.02, 0.9))
+    if posicion is None:
+        posicion = float(rng.uniform(0.02, 0.9))
+    t = inicio + duracion_total * posicion
     # Ataques locales/adyacentes salen de la red corporativa (host comprometido)
     ip = f"10.20.{rng.integers(0, 32)}.{rng.integers(2, 254)}" if local else _ip_publica(rng)
     # Los ataques sigilosos o indirectos (vía usuario víctima) usan UA de navegador/SDK
@@ -440,7 +469,8 @@ def generar_campana(vuln: pd.Series, cfg, rng: np.random.Generator) -> pd.DataFr
 def ejecutar(vulns: pd.DataFrame, cfg, destino=None) -> pd.DataFrame:
     rng = np.random.default_rng(cfg.semilla)
     normal = generar_trafico_normal(cfg, rng)
-    ataques = [generar_campana(v, cfg, rng) for _, v in vulns.iterrows()]
+    posiciones = posiciones_estratificadas(vulns, rng, cfg.fraccion_entrenamiento)
+    ataques = [generar_campana(v, cfg, rng, posiciones[i]) for i, v in vulns.iterrows()]
     trafico = (
         pd.concat([normal, *ataques], ignore_index=True)
         .sort_values("timestamp", kind="stable")
