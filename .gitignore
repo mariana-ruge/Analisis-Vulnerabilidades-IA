@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# Artefactos generados por el pipeline (reproducibles con `python -m pipeline`)
+salidas/
