@@ -10,7 +10,7 @@ from pipeline.detectar import detectar
 
 @pytest.fixture(scope="module")
 def cfg(tmp_path_factory):
-    c = Config(dias_simulacion=2, peticiones_normales_por_hora=200, n_arboles=50)
+    c = Config(dias_simulacion=3, peticiones_normales_por_hora=600, n_arboles=50)
     c.dir_salidas = tmp_path_factory.mktemp("salidas")
     c.crear_directorios()
     return c
@@ -46,6 +46,14 @@ def test_simulador_reproducible_y_etiquetado(vulns, cfg, trafico):
     assert trafico.loc[trafico.es_anomalo == 1, "avidId"].notna().all()
     otra = simulador.ejecutar(vulns, cfg)
     pd.testing.assert_frame_equal(trafico, otra)
+
+
+def test_campanas_repartidas_entre_train_y_test(trafico):
+    train, test, _ = modelo.particion_temporal(trafico, 0.7)
+    cats = lambda d: set(d.loc[d.es_anomalo == 1, "categoria_ataque"])  # noqa: E731
+    # Toda categoría con ≥2 vulnerabilidades debe tener ataques en ambos lados del corte
+    frecuentes = {c for c, n in trafico.groupby("categoria_ataque")["avidId"].nunique().items() if n >= 2}
+    assert frecuentes <= cats(train) & cats(test)
 
 
 def test_features_sin_nulos_y_sin_fuga_de_etiquetas(trafico):

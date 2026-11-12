@@ -49,6 +49,9 @@ Todo lo generado va a `salidas/` (ignorado por git, se regenera con la semilla):
      oculto dentro de contenido legítimo, `PR:None` → sin token, `AV:Local` → IP interna, score →
      volumen. El 30 % de campañas ofusca payloads (base64, URL-encoding, mayúsculas), el 30 % rota
      IP y el 25 % usa un token robado.
+   - *Reparto temporal estratificado*: en cada categoría con 2 o más vulnerabilidades, ~30 % de
+     las campañas empiezan después del corte train/test y el resto antes. Así todas las categorías
+     se evalúan, siempre con vulnerabilidades que el modelo no vio al entrenar.
 3. **Características** ([pipeline/caracteristicas.py](pipeline/caracteristicas.py)): 28 features
    numéricas (tamaño/entropía del payload, 8 familias de indicadores léxicos, estado, bytes,
    latencia, hora cíclica, comportamiento por IP en ventanas de 5 min) + método, endpoint
@@ -61,17 +64,21 @@ Todo lo generado va a `salidas/` (ignorado por git, se regenera con la semilla):
 
 ## Resultados (semilla 42)
 
-66 405 eventos, 5,3 % anómalos; prueba = 19 922 eventos con 15 campañas.
+66 350 eventos, 5,3 % anómalos; prueba = 19 905 eventos con 28 campañas de las 10 categorías.
 
 | Modelo | Precisión | Recall | F1 | ROC-AUC | PR-AUC | FPR |
 |---|---|---|---|---|---|---|
-| Isolation Forest | 0,81 | 0,71 | 0,76 | 0,99 | 0,86 | 0,69 % |
-| Random Forest | 1,00 | 0,99 | 1,00 | 1,00 | 1,00 | 0,00 % |
+| Isolation Forest | 0,87 | 0,74 | 0,80 | 0,99 | 0,90 | 0,80 % |
+| Random Forest | 1,00 | 0,97 | 0,98 | 1,00 | 1,00 | 0,00 % |
+
+Con las semillas 1 y 7 el Isolation Forest obtiene F1 0,82 y 0,66: la cifra depende de qué
+campañas caen en prueba.
 
 Lectura:
-- El Isolation Forest detecta bien inyección de código/prompt, path traversal y fuga de datos
-  (71–83 % de recall), pero casi no ve la **evasión de autorización** (9 %): un IDOR es una
-  petición válida a un endpoint normal; hace falta contexto de sesión/negocio.
+- El Isolation Forest detecta bien fuga de datos, path traversal, cadena de suministro y
+  evasión de autorización (81–97 % de recall); peor la inyección de comandos (36 %).
+- La única campaña SQL/NoSQL de prueba no la detecta ningún modelo (0 % y 6,5 %): con un
+  solo caso por categoría la métrica es muy sensible a cómo sea esa campaña concreta.
 - Sus falsos positivos son casi todos integraciones automáticas legítimas mal configuradas
   (scripts con ráfagas de 401/429/404). Conviene listarlas como conocidas o alertar sobre
   ellas con menor prioridad.
@@ -81,7 +88,7 @@ Lectura:
 ## Limitaciones
 
 - El tráfico es sintético: los payloads salen de plantillas por categoría, no de exploits reales.
-- Con el corte temporal, la prueba solo cubre las categorías cuyas campañas caen en los últimos
-  días (6 de 10 con la semilla 42); cambia `--semilla` para otras combinaciones.
+- Varias categorías tienen solo 1–2 campañas en prueba; su recall es poco estable entre
+  semillas.
 - Las features de comportamiento se calculan dentro de cada lote; para producción habría que
   mantener estado por IP entre lotes.
